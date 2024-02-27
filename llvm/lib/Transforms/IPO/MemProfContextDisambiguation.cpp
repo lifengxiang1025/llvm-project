@@ -3375,10 +3375,34 @@ bool MemProfContextDisambiguation::applyImport(Module &M) {
 
     auto *GVSummary =
         ImportSummary->findSummaryInModule(TheFnVI, M.getModuleIdentifier());
-    if (!GVSummary)
+    
+    StringRef SrcModule(M.getSourceFileName());
+    auto SrcModuleMD = F.getMetadata("thinlto_src_module");
+    if (SrcModuleMD) {
+      SrcModule = dyn_cast<MDString>(SrcModuleMD->getOperand(0))->getString();
+      llvm::outs() << "SrcModule: " << SrcModule.str() << "\n";
+    }
+
+    auto SrcFileMD = F.getMetadata("thinlto_src_file");
+    if (SrcFileMD) {
+      llvm::outs() << "SrcModule: " << 
+        dyn_cast<MDString>(SrcFileMD->getOperand(0))->getString().str() << "\n";
+    }
+
+    if (!GVSummary){
       // Must have been imported, use the first summary (might be multiple if
       // this was a linkonce_odr).
       GVSummary = TheFnVI.getSummaryList().front().get();
+      for (auto& GVS : TheFnVI.getSummaryList()) {
+        if (GVS->modulePath() == SrcModule) {
+          GVSummary = GVS.get();
+          break;
+        }
+      }
+      F.dump();
+      llvm::outs() << GVSummary->modulePath().str() << " " << SrcModule.str() << "\n";
+      //assert(GVSummary->modulePath() == SrcModule);
+    }
 
     // If this was an imported alias skip it as we won't have the function
     // summary, and it should be cloned in the original module.

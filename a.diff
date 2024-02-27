@@ -1,0 +1,4025 @@
+diff --git a/clang/include/clang/Basic/CodeGenOptions.def b/clang/include/clang/Basic/CodeGenOptions.def
+index 7c0bfe328496..6ad050319625 100644
+--- a/clang/include/clang/Basic/CodeGenOptions.def
++++ b/clang/include/clang/Basic/CodeGenOptions.def
+@@ -96,6 +96,7 @@ ENUM_CODEGENOPT(InlineAsmDialect, InlineAsmDialectKind, 1, IAD_ATT)
+ CODEGENOPT(ForbidGuardVariables , 1, 0) ///< Issue errors if C++ guard variables
+                                         ///< are required.
+ CODEGENOPT(FunctionSections  , 1, 0) ///< Set when -ffunction-sections is enabled.
++CODEGENOPT(BBAddrMap  , 1, 0) ///< Set when -fbasic-block-address-map is enabled.
+ CODEGENOPT(InstrumentFunctions , 1, 0) ///< Set when -finstrument-functions is
+                                        ///< enabled.
+ CODEGENOPT(InstrumentFunctionsAfterInlining , 1, 0) ///< Set when
+diff --git a/clang/include/clang/Driver/Options.td b/clang/include/clang/Driver/Options.td
+index a4b35e370999..73071a664854 100644
+--- a/clang/include/clang/Driver/Options.td
++++ b/clang/include/clang/Driver/Options.td
+@@ -3988,6 +3988,10 @@ defm function_sections : BoolFOption<"function-sections",
+   PosFlag<SetTrue, [], [ClangOption, CC1Option],
+           "Place each function in its own section">,
+   NegFlag<SetFalse>>;
++defm basic_block_address_map : BoolFOption<"basic-block-address-map",
++  CodeGenOpts<"BBAddrMap">, DefaultFalse,
++  PosFlag<SetTrue, [], [CC1Option], "Emit the basic block address map section.">,
++  NegFlag<SetFalse>>;
+ def fbasic_block_sections_EQ : Joined<["-"], "fbasic-block-sections=">, Group<f_Group>,
+   Visibility<[ClangOption, CC1Option, CC1AsOption]>,
+   HelpText<"Place each function's basic blocks in unique sections (ELF Only)">,
+diff --git a/clang/lib/CodeGen/BackendUtil.cpp b/clang/lib/CodeGen/BackendUtil.cpp
+index 7877e20d77f7..e2511aa1b5c9 100644
+--- a/clang/lib/CodeGen/BackendUtil.cpp
++++ b/clang/lib/CodeGen/BackendUtil.cpp
+@@ -374,6 +374,7 @@ static bool initTargetOptions(DiagnosticsEngine &Diags,
+                               LangOptions::FPModeKind::FPM_FastHonorPragmas);
+   Options.ApproxFuncFPMath = LangOpts.ApproxFunc;
+ 
++  Options.BBAddrMap = CodeGenOpts.BBAddrMap;
+   Options.BBSections =
+       llvm::StringSwitch<llvm::BasicBlockSection>(CodeGenOpts.BBSections)
+           .Case("all", llvm::BasicBlockSection::All)
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index 6a5f0b3b51b1..7009248bc4f0 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -5944,6 +5944,17 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
+     CmdArgs.push_back("-ffunction-sections");
+   }
+ 
++  if (Arg *A = Args.getLastArg(options::OPT_fbasic_block_address_map,
++                               options::OPT_fno_basic_block_address_map)) {
++    if (Triple.isX86() && Triple.isOSBinFormatELF()) {
++      if (A->getOption().matches(options::OPT_fbasic_block_address_map))
++        A->render(Args, CmdArgs);
++    } else {
++      D.Diag(diag::err_drv_unsupported_opt_for_target)
++          << A->getAsString(Args) << TripleStr;
++    }
++  }
++
+   if (Arg *A = Args.getLastArg(options::OPT_fbasic_block_sections_EQ)) {
+     StringRef Val = A->getValue();
+     if (Triple.isX86() && Triple.isOSBinFormatELF()) {
+diff --git a/clang/test/Driver/basic-block-address-map.c b/clang/test/Driver/basic-block-address-map.c
+new file mode 100644
+index 000000000000..022f972b412d
+--- /dev/null
++++ b/clang/test/Driver/basic-block-address-map.c
+@@ -0,0 +1,8 @@
++// RUN: %clang -### -target x86_64 -fbasic-block-address-map %s -S 2>&1 | FileCheck -check-prefix=CHECK-PRESENT %s
++// CHECK-PRESENT: -fbasic-block-address-map
++
++// RUN: %clang -### -target x86_64 -fno-basic-block-address-map %s -S 2>&1 | FileCheck %s --check-prefix=CHECK-ABSENT
++// CHECK-ABSENT-NOT: -fbasic-block-address-map
++
++// RUN: not %clang -c -target x86_64-apple-darwin10 -fbasic-block-address-map %s -S 2>&1 | FileCheck -check-prefix=CHECK-TRIPLE %s
++// CHECK-TRIPLE: error: unsupported option '-fbasic-block-address-map' for target
+diff --git a/lld/ELF/Config.h b/lld/ELF/Config.h
+index 3a4a47d900fe..fcca8c42b29b 100644
+--- a/lld/ELF/Config.h
++++ b/lld/ELF/Config.h
+@@ -187,6 +187,7 @@ struct Config {
+   llvm::StringRef cmseOutputLib;
+   StringRef zBtiReport = "none";
+   StringRef zCetReport = "none";
++  bool ltoBBAddrMap;
+   llvm::StringRef ltoBasicBlockSections;
+   std::pair<llvm::StringRef, llvm::StringRef> thinLTOObjectSuffixReplace;
+   llvm::StringRef thinLTOPrefixReplaceOld;
+diff --git a/lld/ELF/Driver.cpp b/lld/ELF/Driver.cpp
+index f4b7d1c9d5b9..c19fba6598a8 100644
+--- a/lld/ELF/Driver.cpp
++++ b/lld/ELF/Driver.cpp
+@@ -1298,6 +1298,9 @@ static void readConfigs(opt::InputArgList &args) {
+   config->ltoObjPath = args.getLastArgValue(OPT_lto_obj_path_eq);
+   config->ltoPartitions = args::getInteger(args, OPT_lto_partitions, 1);
+   config->ltoSampleProfile = args.getLastArgValue(OPT_lto_sample_profile);
++  config->ltoBBAddrMap =
++      args.hasFlag(OPT_lto_basic_block_address_map,
++                   OPT_no_lto_basic_block_address_map, false);
+   config->ltoBasicBlockSections =
+       args.getLastArgValue(OPT_lto_basic_block_sections);
+   config->ltoUniqueBasicBlockSectionNames =
+diff --git a/lld/ELF/LTO.cpp b/lld/ELF/LTO.cpp
+index c39c6e6ea74b..3d9200746926 100644
+--- a/lld/ELF/LTO.cpp
++++ b/lld/ELF/LTO.cpp
+@@ -61,6 +61,8 @@ static lto::Config createConfig() {
+   c.Options.FunctionSections = true;
+   c.Options.DataSections = true;
+ 
++  c.Options.BBAddrMap = config->ltoBBAddrMap;
++
+   // Check if basic block sections must be used.
+   // Allowed values for --lto-basic-block-sections are "all", "labels",
+   // "<file name specifying basic block ids>", or none.  This is the equivalent
+diff --git a/lld/ELF/Options.td b/lld/ELF/Options.td
+index c2c9cabc92a4..c10a73e2d9c3 100644
+--- a/lld/ELF/Options.td
++++ b/lld/ELF/Options.td
+@@ -637,6 +637,9 @@ def save_temps_eq: JJ<"save-temps=">, HelpText<"Save select intermediate LTO com
+   Values<"resolution,preopt,promote,internalize,import,opt,precodegen,prelink,combinedindex">;
+ def lto_basic_block_sections: JJ<"lto-basic-block-sections=">,
+   HelpText<"Enable basic block sections for LTO">;
++defm lto_basic_block_address_map: BB<"lto-basic-block-address-map",
++  "Emit basic block address map for LTO",
++  "Do not emit basic block address map for LTO (default)">;
+ defm lto_unique_basic_block_section_names: BB<"lto-unique-basic-block-section-names",
+     "Give unique names to every basic block section for LTO",
+     "Do not give unique names to every basic block section for LTO (default)">;
+diff --git a/lld/test/ELF/lto/basic-block-address-map.ll b/lld/test/ELF/lto/basic-block-address-map.ll
+new file mode 100644
+index 000000000000..b96e7a8401f8
+--- /dev/null
++++ b/lld/test/ELF/lto/basic-block-address-map.ll
+@@ -0,0 +1,28 @@
++; REQUIRES: x86
++; RUN: llvm-as %s -o %t.o
++; RUN: ld.lld %t.o -o %t --lto-basic-block-address-map --lto-O0 --save-temps
++; RUN: llvm-readobj --sections %t.lto.o | FileCheck --check-prefix=SECNAMES %s
++
++; SECNAMES: Type: SHT_LLVM_BB_ADDR_MAP
++
++target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
++target triple = "x86_64-unknown-linux-gnu"
++
++; Function Attrs: nounwind uwtable
++define dso_local void @foo(i32 %b) local_unnamed_addr {
++entry:
++  %tobool.not = icmp eq i32 %b, 0
++  br i1 %tobool.not, label %if.end, label %if.then
++
++if.then:                                          ; preds = %entry
++  tail call void @foo(i32 0)
++  br label %if.end
++
++if.end:                                           ; preds = %entry, %if.then
++  ret void
++}
++
++define void @_start() {
++  call void @foo(i32 1)
++  ret void
++}
+diff --git a/llvm/include/llvm/CodeGen/CommandFlags.h b/llvm/include/llvm/CodeGen/CommandFlags.h
+index bf166a63edb0..d74d72450060 100644
+--- a/llvm/include/llvm/CodeGen/CommandFlags.h
++++ b/llvm/include/llvm/CodeGen/CommandFlags.h
+@@ -159,6 +159,8 @@ struct RegisterCodeGenFlags {
+   RegisterCodeGenFlags();
+ };
+ 
++bool getEnableBBAddrMap();
++
+ llvm::BasicBlockSection getBBSectionsMode(llvm::TargetOptions &Options);
+ 
+ /// Common utility function tightly tied to the options listed here. Initializes
+diff --git a/llvm/include/llvm/Object/ELFTypes.h b/llvm/include/llvm/Object/ELFTypes.h
+index 956f7811dd6c..4986ecf8323d 100644
+--- a/llvm/include/llvm/Object/ELFTypes.h
++++ b/llvm/include/llvm/Object/ELFTypes.h
+@@ -796,6 +796,47 @@ template <class ELFT> struct Elf_Mips_ABIFlags {
+ 
+ // Struct representing the BBAddrMap for one function.
+ struct BBAddrMap {
++
++  // Bitfield of optional features to control the extra information
++  // emitted/encoded in the the section.
++  struct Features {
++    bool FuncEntryCount : 1;
++    bool BBFreq : 1;
++    bool BrProb : 1;
++    bool MultiBBRange : 1;
++
++    bool hasPGOAnalysis() const { return FuncEntryCount || BBFreq || BrProb; }
++
++    bool hasPGOAnalysisBBData() const { return BBFreq || BrProb; }
++
++    // Encodes to minimum bit width representation.
++    uint8_t encode() const {
++      return (static_cast<uint8_t>(FuncEntryCount) << 0) |
++             (static_cast<uint8_t>(BBFreq) << 1) |
++             (static_cast<uint8_t>(BrProb) << 2) |
++             (static_cast<uint8_t>(MultiBBRange) << 3);
++    }
++
++    // Decodes from minimum bit width representation and validates no
++    // unnecessary bits are used.
++    static Expected<Features> decode(uint8_t Val) {
++      Features Feat{
++          static_cast<bool>(Val & (1 << 0)), static_cast<bool>(Val & (1 << 1)),
++          static_cast<bool>(Val & (1 << 2)), static_cast<bool>(Val & (1 << 3))};
++      if (Feat.encode() != Val)
++        return createStringError(
++            std::error_code(), "invalid encoding for BBAddrMap::Features: 0x%x",
++            Val);
++      return Feat;
++    }
++
++    bool operator==(const Features &Other) const {
++      return std::tie(FuncEntryCount, BBFreq, BrProb, MultiBBRange) ==
++             std::tie(Other.FuncEntryCount, Other.BBFreq, Other.BrProb,
++                      Other.MultiBBRange);
++    }
++  };
++
+   // Struct representing the BBAddrMap information for one basic block.
+   struct BBEntry {
+     struct Metadata {
+@@ -838,10 +879,11 @@ struct BBAddrMap {
+       }
+     };
+ 
+-    uint32_t ID;     // Unique ID of this basic block.
+-    uint32_t Offset; // Offset of basic block relative to function start.
+-    uint32_t Size;   // Size of the basic block.
+-    Metadata MD;     // Metdata for this basic block.
++    uint32_t ID = 0;     // Unique ID of this basic block.
++    uint32_t Offset = 0; // Offset of basic block relative to the base address.
++    uint32_t Size = 0;   // Size of the basic block.
++    Metadata MD = {false, false, false, false,
++                   false}; // Metdata for this basic block.
+ 
+     BBEntry(uint32_t ID, uint32_t Offset, uint32_t Size, Metadata MD)
+         : ID(ID), Offset(Offset), Size(Size), MD(MD){};
+@@ -858,62 +900,64 @@ struct BBAddrMap {
+     bool hasIndirectBranch() const { return MD.HasIndirectBranch; }
+   };
+ 
+-  BBAddrMap(uint64_t Addr, std::vector<BBEntry> BBEntries)
+-      : Addr(Addr), BBEntries(std::move(BBEntries)) {}
++  // Struct representing the BBAddrMap information for a contiguous range of
++  // basic blocks (a function or a basic block section).
++  struct BBRangeEntry {
++    uint64_t BaseAddress = 0;       // Base address of the range.
++    std::vector<BBEntry> BBEntries; // Basic block entries for this range.
++
++    // Equality operator for unit testing.
++    bool operator==(const BBRangeEntry &Other) const {
++      return BaseAddress == Other.BaseAddress &&
++             std::equal(BBEntries.begin(), BBEntries.end(),
++                        Other.BBEntries.begin());
++    }
++  };
+ 
+-  // Returns the address of the corresponding function.
+-  uint64_t getFunctionAddress() const { return Addr; }
++  // All ranges for this function. Cannot be empty. The first range always
++  // corresponds to the function entry.
++  std::vector<BBRangeEntry> BBRanges;
+ 
+-  // Returns the basic block entries for this function.
+-  const std::vector<BBEntry> &getBBEntries() const { return BBEntries; }
++  // Returns the function address associated with this BBAddrMap, which is
++  // stored as the `BaseAddress` of its first BBRangeEntry.
++  uint64_t getFunctionAddress() const {
++    assert(!BBRanges.empty());
++    return BBRanges.front().BaseAddress;
++  }
++
++  // Returns the total number of bb entries in all bb ranges.
++  size_t getNumBBEntries() const {
++    size_t NumBBEntries = 0;
++    for (const auto &BBR : BBRanges)
++      NumBBEntries += BBR.BBEntries.size();
++    return NumBBEntries;
++  }
++
++  // Returns the index of the bb range with the given base address, or
++  // `std::nullopt` if no such range exists.
++  std::optional<size_t>
++  getBBRangeIndexForBaseAddress(uint64_t BaseAddress) const {
++    for (size_t I = 0; I < BBRanges.size(); ++I)
++      if (BBRanges[I].BaseAddress == BaseAddress)
++        return I;
++    return {};
++  }
++
++  // Returns bb entries in the first range.
++  const std::vector<BBEntry> &getBBEntries() const {
++    return BBRanges.front().BBEntries;
++  }
++
++  const std::vector<BBRangeEntry> &getBBRanges() const { return BBRanges; }
+ 
+   // Equality operator for unit testing.
+   bool operator==(const BBAddrMap &Other) const {
+-    return Addr == Other.Addr && std::equal(BBEntries.begin(), BBEntries.end(),
+-                                            Other.BBEntries.begin());
++    return std::equal(BBRanges.begin(), BBRanges.end(), Other.BBRanges.begin());
+   }
+-
+-  uint64_t Addr;                  // Function address
+-  std::vector<BBEntry> BBEntries; // Basic block entries for this function.
+ };
+ 
+ /// A feature extension of BBAddrMap that holds information relevant to PGO.
+ struct PGOAnalysisMap {
+-  /// Bitfield of optional features to include in the PGO extended map.
+-  struct Features {
+-    bool FuncEntryCount : 1;
+-    bool BBFreq : 1;
+-    bool BrProb : 1;
+-
+-    // True if at least one feature is enabled
+-    bool anyEnabled() const { return FuncEntryCount || BBFreq || BrProb; }
+-
+-    // Encodes to minimum bit width representation.
+-    uint8_t encode() const {
+-      return (static_cast<uint8_t>(FuncEntryCount) << 0) |
+-             (static_cast<uint8_t>(BBFreq) << 1) |
+-             (static_cast<uint8_t>(BrProb) << 2);
+-    }
+-
+-    // Decodes from minimum bit width representation and validates no
+-    // unnecessary bits are used.
+-    static Expected<Features> decode(uint8_t Val) {
+-      Features Feat{static_cast<bool>(Val & (1 << 0)),
+-                    static_cast<bool>(Val & (1 << 1)),
+-                    static_cast<bool>(Val & (1 << 2))};
+-      if (Feat.encode() != Val)
+-        return createStringError(
+-            std::error_code(),
+-            "invalid encoding for PGOAnalysisMap::Features: 0x%x", Val);
+-      return Feat;
+-    }
+-
+-    bool operator==(const Features &Other) const {
+-      return std::tie(FuncEntryCount, BBFreq, BrProb) ==
+-             std::tie(Other.FuncEntryCount, Other.BBFreq, Other.BrProb);
+-    }
+-  };
+-
+   /// Extra basic block data with fields for block frequency and branch
+   /// probability.
+   struct PGOBBEntry {
+@@ -945,7 +989,7 @@ struct PGOAnalysisMap {
+   std::vector<PGOBBEntry> BBEntries; // Extended basic block entries
+ 
+   // Flags to indicate if each PGO related info was enabled in this function
+-  Features FeatEnable;
++  BBAddrMap::Features FeatEnable;
+ 
+   bool operator==(const PGOAnalysisMap &Other) const {
+     return std::tie(FuncEntryCount, BBEntries, FeatEnable) ==
+diff --git a/llvm/include/llvm/ObjectYAML/ELFYAML.h b/llvm/include/llvm/ObjectYAML/ELFYAML.h
+index 12b47c271da2..8f045d638362 100644
+--- a/llvm/include/llvm/ObjectYAML/ELFYAML.h
++++ b/llvm/include/llvm/ObjectYAML/ELFYAML.h
+@@ -165,9 +165,21 @@ struct BBAddrMapEntry {
+   };
+   uint8_t Version;
+   llvm::yaml::Hex8 Feature;
+-  llvm::yaml::Hex64 Address;
+-  std::optional<uint64_t> NumBlocks;
+-  std::optional<std::vector<BBEntry>> BBEntries;
++
++  struct BBRangeEntry {
++    llvm::yaml::Hex64 BaseAddress;
++    std::optional<uint64_t> NumBlocks;
++    std::optional<std::vector<BBEntry>> BBEntries;
++  };
++
++  std::optional<uint64_t> NumBBRanges;
++  std::optional<std::vector<BBRangeEntry>> BBRanges;
++
++  llvm::yaml::Hex64 getFunctionAddress() const {
++    if (!BBRanges || BBRanges->empty())
++      return 0;
++    return BBRanges->front().BaseAddress;
++  }
+ };
+ 
+ struct PGOAnalysisMapEntry {
+@@ -751,6 +763,7 @@ bool shouldAllocateFileSpace(ArrayRef<ProgramHeader> Phdrs,
+ LLVM_YAML_IS_SEQUENCE_VECTOR(llvm::ELFYAML::StackSizeEntry)
+ LLVM_YAML_IS_SEQUENCE_VECTOR(llvm::ELFYAML::BBAddrMapEntry)
+ LLVM_YAML_IS_SEQUENCE_VECTOR(llvm::ELFYAML::BBAddrMapEntry::BBEntry)
++LLVM_YAML_IS_SEQUENCE_VECTOR(llvm::ELFYAML::BBAddrMapEntry::BBRangeEntry)
+ LLVM_YAML_IS_SEQUENCE_VECTOR(llvm::ELFYAML::PGOAnalysisMapEntry)
+ LLVM_YAML_IS_SEQUENCE_VECTOR(llvm::ELFYAML::PGOAnalysisMapEntry::PGOBBEntry)
+ LLVM_YAML_IS_SEQUENCE_VECTOR(
+@@ -916,11 +929,15 @@ template <> struct MappingTraits<ELFYAML::StackSizeEntry> {
+ };
+ 
+ template <> struct MappingTraits<ELFYAML::BBAddrMapEntry> {
+-  static void mapping(IO &IO, ELFYAML::BBAddrMapEntry &Rel);
++  static void mapping(IO &IO, ELFYAML::BBAddrMapEntry &E);
++};
++
++template <> struct MappingTraits<ELFYAML::BBAddrMapEntry::BBRangeEntry> {
++  static void mapping(IO &IO, ELFYAML::BBAddrMapEntry::BBRangeEntry &E);
+ };
+ 
+ template <> struct MappingTraits<ELFYAML::BBAddrMapEntry::BBEntry> {
+-  static void mapping(IO &IO, ELFYAML::BBAddrMapEntry::BBEntry &Rel);
++  static void mapping(IO &IO, ELFYAML::BBAddrMapEntry::BBEntry &E);
+ };
+ 
+ template <> struct MappingTraits<ELFYAML::PGOAnalysisMapEntry> {
+diff --git a/llvm/include/llvm/Target/TargetOptions.h b/llvm/include/llvm/Target/TargetOptions.h
+index d02d1699813c..7df8010d55c7 100644
+--- a/llvm/include/llvm/Target/TargetOptions.h
++++ b/llvm/include/llvm/Target/TargetOptions.h
+@@ -148,7 +148,7 @@ namespace llvm {
+           EmulatedTLS(false), EnableTLSDESC(false), EnableIPRA(false),
+           EmitStackSizeSection(false), EnableMachineOutliner(false),
+           EnableMachineFunctionSplitter(false), SupportsDefaultOutlining(false),
+-          EmitAddrsig(false), EmitCallSiteInfo(false),
++          EmitAddrsig(false), BBAddrMap(false), EmitCallSiteInfo(false),
+           SupportsDebugEntryValues(false), EnableDebugEntryValues(false),
+           ValueTrackingVariableLocations(false), ForceDwarfFrameSection(false),
+           XRayFunctionIndex(true), DebugStrictDwarf(false), Hotpatch(false),
+@@ -316,6 +316,10 @@ namespace llvm {
+     /// Emit address-significance table.
+     unsigned EmitAddrsig : 1;
+ 
++    // Emit the SHT_LLVM_BB_ADDR_MAP section containing basic block address
++    // which can be used to map virtual addresses to machine basic blocks.
++    unsigned BBAddrMap : 1;
++
+     /// Emit basic blocks into separate sections.
+     BasicBlockSection BBSections = BasicBlockSection::None;
+ 
+diff --git a/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp b/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
+index 0d573562de96..b961fc2c338a 100644
+--- a/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
++++ b/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
+@@ -151,8 +151,9 @@ static cl::bits<PGOMapFeaturesEnum> PgoAnalysisMapFeatures(
+                           "Basic Block Frequency"),
+                clEnumValN(PGOMapFeaturesEnum::BrProb, "br-prob",
+                           "Branch Probability")),
+-    cl::desc("Enable extended information within the BBAddrMap that is "
+-             "extracted from PGO related analysis."));
++    cl::desc(
++        "Enable extended information within the SHT_LLVM_BB_ADDR_MAP that is "
++        "extracted from PGO related analysis."));
+ 
+ const char DWARFGroupName[] = "dwarf";
+ const char DWARFGroupDescription[] = "DWARF Emission";
+@@ -1371,6 +1372,14 @@ static uint32_t getBBAddrMapMetadata(const MachineBasicBlock &MBB) {
+       .encode();
+ }
+ 
++static llvm::object::BBAddrMap::Features
++getBBAddrMapFeature(const MachineFunction &MF, int NumMBBSectionRanges) {
++  return {PgoAnalysisMapFeatures.isSet(PGOMapFeaturesEnum::FuncEntryCount),
++          PgoAnalysisMapFeatures.isSet(PGOMapFeaturesEnum::BBFreq),
++          PgoAnalysisMapFeatures.isSet(PGOMapFeaturesEnum::BrProb),
++          MF.hasBBSections() && NumMBBSectionRanges > 1};
++}
++
+ void AsmPrinter::emitBBAddrMapSection(const MachineFunction &MF) {
+   MCSection *BBAddrMapSection =
+       getObjFileLowering().getBBAddrMapSection(*MF.getSection());
+@@ -1384,17 +1393,48 @@ void AsmPrinter::emitBBAddrMapSection(const MachineFunction &MF) {
+   uint8_t BBAddrMapVersion = OutStreamer->getContext().getBBAddrMapVersion();
+   OutStreamer->emitInt8(BBAddrMapVersion);
+   OutStreamer->AddComment("feature");
+-  auto FeaturesBits = static_cast<uint8_t>(PgoAnalysisMapFeatures.getBits());
+-  OutStreamer->emitInt8(FeaturesBits);
+-  OutStreamer->AddComment("function address");
+-  OutStreamer->emitSymbolValue(FunctionSymbol, getPointerSize());
+-  OutStreamer->AddComment("number of basic blocks");
+-  OutStreamer->emitULEB128IntValue(MF.size());
+-  const MCSymbol *PrevMBBEndSymbol = FunctionSymbol;
++  auto Features = getBBAddrMapFeature(MF, MBBSectionRanges.size());
++  OutStreamer->emitInt8(Features.encode());
+   // Emit BB Information for each basic block in the function.
++  if (Features.MultiBBRange) {
++    OutStreamer->AddComment("number of basic block ranges");
++    OutStreamer->emitULEB128IntValue(MBBSectionRanges.size());
++  }
++  // Number of blocks in each MBB section.
++  MapVector<unsigned, unsigned> MBBSectionNumBlocks;
++  const MCSymbol *PrevMBBEndSymbol = nullptr;
++  if (!Features.MultiBBRange) {
++    OutStreamer->AddComment("function address");
++    OutStreamer->emitSymbolValue(FunctionSymbol, getPointerSize());
++    OutStreamer->AddComment("number of basic blocks");
++    OutStreamer->emitULEB128IntValue(MF.size());
++    PrevMBBEndSymbol = FunctionSymbol;
++  } else {
++    unsigned BBCount = 0;
++    for (const MachineBasicBlock &MBB : MF) {
++      BBCount++;
++      if (MBB.isEndSection()) {
++        // Store each section's basic block count when it ends.
++        MBBSectionNumBlocks[MBB.getSectionIDNum()] = BBCount;
++        // Reset the count for the next section.
++        BBCount = 0;
++      }
++    }
++  }
++  // Emit the BB entry for each basic block in the function.
+   for (const MachineBasicBlock &MBB : MF) {
+     const MCSymbol *MBBSymbol =
+         MBB.isEntryBlock() ? FunctionSymbol : MBB.getSymbol();
++    bool IsBeginSection =
++        Features.MultiBBRange && (MBB.isBeginSection() || MBB.isEntryBlock());
++    if (IsBeginSection) {
++      OutStreamer->AddComment("base address");
++      OutStreamer->emitSymbolValue(MBBSymbol, getPointerSize());
++      OutStreamer->AddComment("number of basic blocks");
++      OutStreamer->emitULEB128IntValue(
++          MBBSectionNumBlocks[MBB.getSectionIDNum()]);
++      PrevMBBEndSymbol = MBBSymbol;
++    }
+     // TODO: Remove this check when version 1 is deprecated.
+     if (BBAddrMapVersion > 1) {
+       OutStreamer->AddComment("BB id");
+@@ -1416,35 +1456,32 @@ void AsmPrinter::emitBBAddrMapSection(const MachineFunction &MF) {
+     PrevMBBEndSymbol = MBB.getEndSymbol();
+   }
+ 
+-  if (FeaturesBits != 0) {
++  if (Features.hasPGOAnalysis()) {
+     assert(BBAddrMapVersion >= 2 &&
+            "PGOAnalysisMap only supports version 2 or later");
+ 
+-    auto FeatEnable =
+-        cantFail(object::PGOAnalysisMap::Features::decode(FeaturesBits));
+-
+-    if (FeatEnable.FuncEntryCount) {
++    if (Features.FuncEntryCount) {
+       OutStreamer->AddComment("function entry count");
+       auto MaybeEntryCount = MF.getFunction().getEntryCount();
+       OutStreamer->emitULEB128IntValue(
+           MaybeEntryCount ? MaybeEntryCount->getCount() : 0);
+     }
+     const MachineBlockFrequencyInfo *MBFI =
+-        FeatEnable.BBFreq
++        Features.BBFreq
+             ? &getAnalysis<LazyMachineBlockFrequencyInfoPass>().getBFI()
+             : nullptr;
+     const MachineBranchProbabilityInfo *MBPI =
+-        FeatEnable.BrProb ? &getAnalysis<MachineBranchProbabilityInfo>()
+-                          : nullptr;
++        Features.BrProb ? &getAnalysis<MachineBranchProbabilityInfo>()
++                        : nullptr;
+ 
+-    if (FeatEnable.BBFreq || FeatEnable.BrProb) {
++    if (Features.BBFreq || Features.BrProb) {
+       for (const MachineBasicBlock &MBB : MF) {
+-        if (FeatEnable.BBFreq) {
++        if (Features.BBFreq) {
+           OutStreamer->AddComment("basic block frequency");
+           OutStreamer->emitULEB128IntValue(
+               MBFI->getBlockFreq(&MBB).getFrequency());
+         }
+-        if (FeatEnable.BrProb) {
++        if (Features.BrProb) {
+           unsigned SuccCount = MBB.succ_size();
+           OutStreamer->AddComment("basic block successor count");
+           OutStreamer->emitULEB128IntValue(SuccCount);
+@@ -1833,7 +1870,7 @@ void AsmPrinter::emitFunctionBody() {
+     // We must emit temporary symbol for the end of this basic block, if either
+     // we have BBLabels enabled or if this basic blocks marks the end of a
+     // section.
+-    if (MF->hasBBLabels() ||
++    if (MF->hasBBLabels() || MF->getTarget().Options.BBAddrMap ||
+         (MAI->hasDotTypeDotSizeDirective() && MBB.isEndSection()))
+       OutStreamer->emitLabel(MBB.getEndSymbol());
+ 
+@@ -1986,7 +2023,7 @@ void AsmPrinter::emitFunctionBody() {
+   // Emit section containing BB address offsets and their metadata, when
+   // BB labels are requested for this function. Skip empty functions.
+   if (HasAnyRealCode) {
+-    if (MF->hasBBLabels())
++    if (MF->hasBBLabels() || MF->getTarget().Options.BBAddrMap)
+       emitBBAddrMapSection(*MF);
+     else if (PgoAnalysisMapFeatures.getBits() != 0)
+       MF->getContext().reportWarning(
+@@ -2580,9 +2617,9 @@ void AsmPrinter::SetupMachineFunction(MachineFunction &MF) {
+   bool NeedsLocalForSize = MAI->needsLocalForSize();
+   if (F.hasFnAttribute("patchable-function-entry") ||
+       F.hasFnAttribute("function-instrument") ||
+-      F.hasFnAttribute("xray-instruction-threshold") ||
+-      needFuncLabels(MF) || NeedsLocalForSize ||
+-      MF.getTarget().Options.EmitStackSizeSection || MF.hasBBLabels()) {
++      F.hasFnAttribute("xray-instruction-threshold") || needFuncLabels(MF) ||
++      NeedsLocalForSize || MF.getTarget().Options.EmitStackSizeSection ||
++      MF.getTarget().Options.BBAddrMap || MF.hasBBLabels()) {
+     CurrentFnBegin = createTempSymbol("func_begin");
+     if (NeedsLocalForSize)
+       CurrentFnSymForSize = CurrentFnBegin;
+@@ -4049,7 +4086,9 @@ bool AsmPrinter::shouldEmitLabelForBasicBlock(
+   // With `-fbasic-block-sections=`, a label is needed for every non-entry block
+   // in the labels mode (option `=labels`) and every section beginning in the
+   // sections mode (`=all` and `=list=`).
+-  if ((MF->hasBBLabels() || MBB.isBeginSection()) && !MBB.isEntryBlock())
++  if ((MF->hasBBLabels() || MF->getTarget().Options.BBAddrMap ||
++       MBB.isBeginSection()) &&
++      !MBB.isEntryBlock())
+     return true;
+   // A label is needed for any block with at least one predecessor (when that
+   // predecessor is not the fallthrough predecessor, or if it is an EH funclet
+diff --git a/llvm/lib/CodeGen/BasicBlockSections.cpp b/llvm/lib/CodeGen/BasicBlockSections.cpp
+index dbb6ebb3d7eb..eb3f9e7078f1 100644
+--- a/llvm/lib/CodeGen/BasicBlockSections.cpp
++++ b/llvm/lib/CodeGen/BasicBlockSections.cpp
+@@ -57,10 +57,10 @@
+ //    function into potentially several disjoint pieces, and CFI needs to be
+ //    emitted per cluster. This also bloats the object file and binary sizes.
+ //
+-// Basic Block Labels
++// Basic Block Address Map
+ // ==================
+ //
+-// With -fbasic-block-sections=labels, we encode the offsets of BB addresses of
++// With -fbasic-block-address-map, we emit the offsets of BB addresses of
+ // every function into the .llvm_bb_addr_map section. Along with the function
+ // symbols, this allows for mapping of virtual addresses in PMU profiles back to
+ // the corresponding basic blocks. This logic is implemented in AsmPrinter. This
+@@ -118,6 +118,10 @@ public:
+   /// Identify basic blocks that need separate sections and prepare to emit them
+   /// accordingly.
+   bool runOnMachineFunction(MachineFunction &MF) override;
++
++private:
++  bool handleBBSections(MachineFunction &MF);
++  bool handleBBAddrMap(MachineFunction &MF);
+ };
+ 
+ } // end anonymous namespace
+@@ -280,10 +284,12 @@ bool llvm::hasInstrProfHashMismatch(MachineFunction &MF) {
+   return false;
+ }
+ 
+-bool BasicBlockSections::runOnMachineFunction(MachineFunction &MF) {
++// Identify, arrange, and modify basic blocks which need separate sections
++// according to the specification provided by the -fbasic-block-sections flag.
++bool BasicBlockSections::handleBBSections(MachineFunction &MF) {
+   auto BBSectionsType = MF.getTarget().getBBSectionsType();
+-  assert(BBSectionsType != BasicBlockSection::None &&
+-         "BB Sections not enabled!");
++  if (BBSectionsType == BasicBlockSection::None)
++    return false;
+ 
+   // Check for source drift. If the source has changed since the profiles
+   // were obtained, optimizing basic blocks might be sub-optimal.
+@@ -300,7 +306,7 @@ bool BasicBlockSections::runOnMachineFunction(MachineFunction &MF) {
+ 
+   if (BBSectionsType == BasicBlockSection::Labels) {
+     MF.setBBSectionsType(BBSectionsType);
+-    return false;
++    return true;
+   }
+ 
+   DenseMap<UniqueBBID, BBClusterInfo> FuncClusterInfo;
+@@ -364,6 +370,27 @@ bool BasicBlockSections::runOnMachineFunction(MachineFunction &MF) {
+   return true;
+ }
+ 
++// When the BB address map needs to be generated, this renumbers basic blocks to
++// make them appear in increasing order of their IDs in the function. This
++// avoids the need to store basic block IDs in the BB address map section, since
++// they can be determined implicitly.
++bool BasicBlockSections::handleBBAddrMap(MachineFunction &MF) {
++  if (MF.getTarget().getBBSectionsType() == BasicBlockSection::Labels)
++    return false;
++  if (!MF.getTarget().Options.BBAddrMap)
++    return false;
++  MF.RenumberBlocks();
++  return true;
++}
++
++bool BasicBlockSections::runOnMachineFunction(MachineFunction &MF) {
++  // First handle the basic block sections.
++  auto R1 = handleBBSections(MF);
++  // Handle basic block address map after basic block sections are finalized.
++  auto R2 = handleBBAddrMap(MF);
++  return R1 || R2;
++}
++
+ void BasicBlockSections::getAnalysisUsage(AnalysisUsage &AU) const {
+   AU.setPreservesAll();
+   AU.addRequired<BasicBlockSectionsProfileReaderWrapperPass>();
+diff --git a/llvm/lib/CodeGen/CommandFlags.cpp b/llvm/lib/CodeGen/CommandFlags.cpp
+index 51406fb287e6..d82b2a85016c 100644
+--- a/llvm/lib/CodeGen/CommandFlags.cpp
++++ b/llvm/lib/CodeGen/CommandFlags.cpp
+@@ -90,6 +90,7 @@ CGOPT_EXP(bool, DataSections)
+ CGOPT_EXP(bool, FunctionSections)
+ CGOPT(bool, IgnoreXCOFFVisibility)
+ CGOPT(bool, XCOFFTracebackTable)
++CGOPT(bool, EnableBBAddrMap)
+ CGOPT(std::string, BBSections)
+ CGOPT(unsigned, TLSSize)
+ CGOPT_EXP(bool, EmulatedTLS)
+@@ -390,6 +391,11 @@ codegen::RegisterCodeGenFlags::RegisterCodeGenFlags() {
+       cl::init(true));
+   CGBINDOPT(XCOFFTracebackTable);
+ 
++  static cl::opt<bool> EnableBBAddrMap(
++      "basic-block-address-map",
++      cl::desc("Emit the basic block address map section"), cl::init(false));
++  CGBINDOPT(EnableBBAddrMap);
++
+   static cl::opt<std::string> BBSections(
+       "basic-block-sections",
+       cl::desc("Emit basic blocks into separate sections"),
+@@ -568,6 +574,7 @@ codegen::InitTargetOptionsFromCodeGenFlags(const Triple &TheTriple) {
+   Options.FunctionSections = getFunctionSections();
+   Options.IgnoreXCOFFVisibility = getIgnoreXCOFFVisibility();
+   Options.XCOFFTracebackTable = getXCOFFTracebackTable();
++  Options.BBAddrMap = getEnableBBAddrMap();
+   Options.BBSections = getBBSectionsMode(Options);
+   Options.UniqueSectionNames = getUniqueSectionNames();
+   Options.UniqueBasicBlockSectionNames = getUniqueBasicBlockSectionNames();
+diff --git a/llvm/lib/CodeGen/MachineFunction.cpp b/llvm/lib/CodeGen/MachineFunction.cpp
+index 57af571ed9bf..323f1a6a1b2b 100644
+--- a/llvm/lib/CodeGen/MachineFunction.cpp
++++ b/llvm/lib/CodeGen/MachineFunction.cpp
+@@ -467,6 +467,7 @@ MachineFunction::CreateMachineBasicBlock(const BasicBlock *BB,
+   // `-basic-block-sections=list` to allow robust mapping of profiles to basic
+   // blocks.
+   if (Target.getBBSectionsType() == BasicBlockSection::Labels ||
++      Target.Options.BBAddrMap ||
+       Target.getBBSectionsType() == BasicBlockSection::List)
+     MBB->setBBID(BBID.has_value() ? *BBID : UniqueBBID{NextBBID++, 0});
+   return MBB;
+diff --git a/llvm/lib/CodeGen/TargetPassConfig.cpp b/llvm/lib/CodeGen/TargetPassConfig.cpp
+index 599ca4818904..e82f14e87814 100644
+--- a/llvm/lib/CodeGen/TargetPassConfig.cpp
++++ b/llvm/lib/CodeGen/TargetPassConfig.cpp
+@@ -1221,19 +1221,13 @@ void TargetPassConfig::addMachinePasses() {
+     addPass(createMIRAddFSDiscriminatorsPass(
+         sampleprof::FSDiscriminatorPass::PassLast));
+ 
++  bool NeedsBBSections =
++      TM->getBBSectionsType() != llvm::BasicBlockSection::None;
+   // Machine function splitter uses the basic block sections feature. Both
+-  // cannot be enabled at the same time. Basic block sections takes precedence.
+-  // FIXME: In principle, BasicBlockSection::Labels and splitting can used
+-  // together. Update this check once we have addressed any issues.
+-  if (TM->getBBSectionsType() != llvm::BasicBlockSection::None) {
+-    if (TM->getBBSectionsType() == llvm::BasicBlockSection::List) {
+-      addPass(llvm::createBasicBlockSectionsProfileReaderWrapperPass(
+-          TM->getBBSectionsFuncListBuf()));
+-      addPass(llvm::createBasicBlockPathCloningPass());
+-    }
+-    addPass(llvm::createBasicBlockSectionsPass());
+-  } else if (TM->Options.EnableMachineFunctionSplitter ||
+-             EnableMachineFunctionSplitter) {
++  // cannot be enabled at the same time. We do not apply machine function
++  // splitter if -basic-block-sections is requested.
++  if (!NeedsBBSections && (TM->Options.EnableMachineFunctionSplitter ||
++                           EnableMachineFunctionSplitter)) {
+     const std::string ProfileFile = getFSProfileFile(TM);
+     if (!ProfileFile.empty()) {
+       if (EnableFSDiscriminator) {
+@@ -1250,6 +1244,16 @@ void TargetPassConfig::addMachinePasses() {
+     }
+     addPass(createMachineFunctionSplitterPass());
+   }
++  // We run the BasicBlockSections pass if either we need BB sections or BB
++  // address map (or both).
++  if (NeedsBBSections || TM->Options.BBAddrMap) {
++    if (TM->getBBSectionsType() == llvm::BasicBlockSection::List) {
++      addPass(llvm::createBasicBlockSectionsProfileReaderWrapperPass(
++          TM->getBBSectionsFuncListBuf()));
++      addPass(llvm::createBasicBlockPathCloningPass());
++    }
++    addPass(llvm::createBasicBlockSectionsPass());
++  }
+ 
+   addPostBBSections();
+ 
+diff --git a/llvm/lib/Object/ELF.cpp b/llvm/lib/Object/ELF.cpp
+index f24395b02043..137f606dd2d4 100644
+--- a/llvm/lib/Object/ELF.cpp
++++ b/llvm/lib/Object/ELF.cpp
+@@ -693,6 +693,17 @@ decodeBBAddrMapImpl(const ELFFile<ELFT> &EF,
+     for (typename ELFFile<ELFT>::Elf_Rela Rela : *Relas)
+       FunctionOffsetTranslations[Rela.r_offset] = Rela.r_addend;
+   }
++  auto GetAddressForRelocation =
++      [&](unsigned RelocationOffsetInSection) -> Expected<unsigned> {
++    auto FOTIterator =
++        FunctionOffsetTranslations.find(RelocationOffsetInSection);
++    if (FOTIterator == FunctionOffsetTranslations.end()) {
++      return createError("failed to get relocation data for offset: " +
++                         Twine::utohexstr(RelocationOffsetInSection) +
++                         " in section " + describe(EF, Sec));
++    }
++    return FOTIterator->second;
++  };
+   Expected<ArrayRef<uint8_t>> ContentsOrErr = EF.getSectionContents(Sec);
+   if (!ContentsOrErr)
+     return ContentsOrErr.takeError();
+@@ -704,9 +715,26 @@ decodeBBAddrMapImpl(const ELFFile<ELFT> &EF,
+   Error ULEBSizeErr = Error::success();
+   Error MetadataDecodeErr = Error::success();
+ 
++  // Helper lampda to extract the (possiblly relocatable) address stored at Cur.
++  auto ExtractAddress = [&]() -> Expected<typename ELFFile<ELFT>::uintX_t> {
++    uint64_t RelocationOffsetInSection = Cur.tell();
++    auto Address =
++        static_cast<typename ELFFile<ELFT>::uintX_t>(Data.getAddress(Cur));
++    if (!Cur)
++      return Cur.takeError();
++    if (!IsRelocatable)
++      return Address;
++    assert(Address == 0);
++    Expected<unsigned> AddressOrErr =
++        GetAddressForRelocation(RelocationOffsetInSection);
++    if (!AddressOrErr)
++      return AddressOrErr.takeError();
++    return *AddressOrErr;
++  };
++
+   uint8_t Version = 0;
+   uint8_t Feature = 0;
+-  PGOAnalysisMap::Features FeatEnable{};
++  BBAddrMap::Features FeatEnable{};
+   while (!ULEBSizeErr && !MetadataDecodeErr && Cur &&
+          Cur.tell() < Content.size()) {
+     if (Sec.sh_type == ELF::SHT_LLVM_BB_ADDR_MAP) {
+@@ -719,11 +747,10 @@ decodeBBAddrMapImpl(const ELFFile<ELFT> &EF,
+       Feature = Data.getU8(Cur); // Feature byte
+       if (!Cur)
+         break;
+-      auto FeatEnableOrErr = PGOAnalysisMap::Features::decode(Feature);
++      auto FeatEnableOrErr = BBAddrMap::Features::decode(Feature);
+       if (!FeatEnableOrErr)
+         return FeatEnableOrErr.takeError();
+-      FeatEnable =
+-          FeatEnableOrErr ? *FeatEnableOrErr : PGOAnalysisMap::Features{};
++      FeatEnable = *FeatEnableOrErr;
+       if (Feature != 0 && Version < 2 && Cur)
+         return createError(
+             "version should be >= 2 for SHT_LLVM_BB_ADDR_MAP when "
+@@ -731,50 +758,65 @@ decodeBBAddrMapImpl(const ELFFile<ELFT> &EF,
+             Twine(static_cast<int>(Version)) +
+             " feature = " + Twine(static_cast<int>(Feature)));
+     }
+-    uint64_t SectionOffset = Cur.tell();
+-    auto Address =
+-        static_cast<typename ELFFile<ELFT>::uintX_t>(Data.getAddress(Cur));
+-    if (!Cur)
+-      return Cur.takeError();
+-    if (IsRelocatable) {
+-      assert(Address == 0);
+-      auto FOTIterator = FunctionOffsetTranslations.find(SectionOffset);
+-      if (FOTIterator == FunctionOffsetTranslations.end()) {
+-        return createError("failed to get relocation data for offset: " +
+-                           Twine::utohexstr(SectionOffset) + " in section " +
+-                           describe(EF, Sec));
+-      }
+-      Address = FOTIterator->second;
+-    }
+-    uint32_t NumBlocks = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
+-
++    uint32_t NumBlocksInBBRange = 0;
++    uint32_t NumBBRanges = 1;
++    typename ELFFile<ELFT>::uintX_t RangeBaseAddress = 0;
+     std::vector<BBAddrMap::BBEntry> BBEntries;
+-    uint32_t PrevBBEndOffset = 0;
+-    for (uint32_t BlockIndex = 0;
+-         !MetadataDecodeErr && !ULEBSizeErr && Cur && (BlockIndex < NumBlocks);
+-         ++BlockIndex) {
+-      uint32_t ID = Version >= 2
+-                        ? readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr)
+-                        : BlockIndex;
+-      uint32_t Offset = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
+-      uint32_t Size = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
+-      uint32_t MD = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
+-      if (Version >= 1) {
+-        // Offset is calculated relative to the end of the previous BB.
+-        Offset += PrevBBEndOffset;
+-        PrevBBEndOffset = Offset + Size;
+-      }
+-      Expected<BBAddrMap::BBEntry::Metadata> MetadataOrErr =
+-          BBAddrMap::BBEntry::Metadata::decode(MD);
+-      if (!MetadataOrErr) {
+-        MetadataDecodeErr = MetadataOrErr.takeError();
++    if (FeatEnable.MultiBBRange) {
++      NumBBRanges = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
++      if (!Cur || ULEBSizeErr)
+         break;
++      if (!NumBBRanges)
++        return createError("invalid zero number of BB ranges at offset " +
++                           Twine::utohexstr(Cur.tell()) + " in " +
++                           describe(EF, Sec));
++    } else {
++      auto AddressOrErr = ExtractAddress();
++      if (!AddressOrErr)
++        return AddressOrErr.takeError();
++      RangeBaseAddress = *AddressOrErr;
++      NumBlocksInBBRange = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
++    }
++    std::vector<BBAddrMap::BBRangeEntry> BBRangeEntries;
++    uint32_t TotalNumBlocks = 0;
++    for (uint32_t BBRangeIndex = 0; BBRangeIndex < NumBBRanges;
++         ++BBRangeIndex) {
++      uint32_t PrevBBEndOffset = 0;
++      if (FeatEnable.MultiBBRange) {
++        auto AddressOrErr = ExtractAddress();
++        if (!AddressOrErr)
++          return AddressOrErr.takeError();
++        RangeBaseAddress = *AddressOrErr;
++        NumBlocksInBBRange = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
++      }
++      for (uint32_t BlockIndex = 0; !MetadataDecodeErr && !ULEBSizeErr && Cur &&
++                                    (BlockIndex < NumBlocksInBBRange);
++           ++BlockIndex) {
++        uint32_t ID = Version >= 2
++                          ? readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr)
++                          : BlockIndex;
++        uint32_t Offset = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
++        uint32_t Size = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
++        uint32_t MD = readULEB128As<uint32_t>(Data, Cur, ULEBSizeErr);
++        if (Version >= 1) {
++          // Offset is calculated relative to the end of the previous BB.
++          Offset += PrevBBEndOffset;
++          PrevBBEndOffset = Offset + Size;
++        }
++        Expected<BBAddrMap::BBEntry::Metadata> MetadataOrErr =
++            BBAddrMap::BBEntry::Metadata::decode(MD);
++        if (!MetadataOrErr) {
++          MetadataDecodeErr = MetadataOrErr.takeError();
++          break;
++        }
++        BBEntries.push_back({ID, Offset, Size, *MetadataOrErr});
+       }
+-      BBEntries.push_back({ID, Offset, Size, *MetadataOrErr});
++      TotalNumBlocks += BBEntries.size();
++      BBRangeEntries.push_back({RangeBaseAddress, std::move(BBEntries)});
+     }
+-    FunctionEntries.emplace_back(Address, std::move(BBEntries));
++    FunctionEntries.push_back({std::move(BBRangeEntries)});
+ 
+-    if (PGOAnalyses || FeatEnable.anyEnabled()) {
++    if (PGOAnalyses || FeatEnable.hasPGOAnalysis()) {
+       // Function entry count
+       uint64_t FuncEntryCount =
+           FeatEnable.FuncEntryCount
+@@ -783,8 +825,8 @@ decodeBBAddrMapImpl(const ELFFile<ELFT> &EF,
+ 
+       std::vector<PGOAnalysisMap::PGOBBEntry> PGOBBEntries;
+       for (uint32_t BlockIndex = 0;
+-           (FeatEnable.BBFreq || FeatEnable.BrProb) && !MetadataDecodeErr &&
+-           !ULEBSizeErr && Cur && (BlockIndex < NumBlocks);
++           FeatEnable.hasPGOAnalysisBBData() && !MetadataDecodeErr &&
++           !ULEBSizeErr && Cur && (BlockIndex < TotalNumBlocks);
+            ++BlockIndex) {
+         // Block frequency
+         uint64_t BBF = FeatEnable.BBFreq
+diff --git a/llvm/lib/ObjectYAML/ELFEmitter.cpp b/llvm/lib/ObjectYAML/ELFEmitter.cpp
+index b044d502c997..58a725f8d877 100644
+--- a/llvm/lib/ObjectYAML/ELFEmitter.cpp
++++ b/llvm/lib/ObjectYAML/ELFEmitter.cpp
+@@ -1419,24 +1419,43 @@ void ELFState<ELFT>::writeSectionContent(
+       CBA.write(E.Feature);
+       SHeader.sh_size += 2;
+     }
+-
+-    if (Section.PGOAnalyses) {
+-      if (E.Version < 2)
+-        WithColor::warning()
+-            << "unsupported SHT_LLVM_BB_ADDR_MAP version when using PGO: "
+-            << static_cast<int>(E.Version) << "; must use version >= 2";
++    auto FeatureOrErr = llvm::object::BBAddrMap::Features::decode(E.Feature);
++    bool MultiBBRangeFeatureEnabled = false;
++    if (!FeatureOrErr)
++      WithColor::warning() << toString(FeatureOrErr.takeError());
++    else
++      MultiBBRangeFeatureEnabled = FeatureOrErr->MultiBBRange;
++    bool MultiBBRange =
++        MultiBBRangeFeatureEnabled ||
++        (E.NumBBRanges.has_value() && E.NumBBRanges.value() != 1) ||
++        (E.BBRanges && E.BBRanges->size() != 1);
++    if (MultiBBRange && !MultiBBRangeFeatureEnabled)
++      WithColor::warning() << "feature value(" << E.Feature
++                           << ") does not support multiple BB ranges.";
++    if (MultiBBRange) {
++      // Write the number of basic block ranges, which is overridden by the
++      // 'NumBBRanges' field when specified.
++      uint64_t NumBBRanges =
++          E.NumBBRanges.value_or(E.BBRanges ? E.BBRanges->size() : 0);
++      SHeader.sh_size += CBA.writeULEB128(NumBBRanges);
+     }
+-
+-    // Write the address of the function.
+-    CBA.write<uintX_t>(E.Address, ELFT::TargetEndianness);
+-    // Write number of BBEntries (number of basic blocks in the function). This
+-    // is overridden by the 'NumBlocks' YAML field when specified.
+-    uint64_t NumBlocks =
+-        E.NumBlocks.value_or(E.BBEntries ? E.BBEntries->size() : 0);
+-    SHeader.sh_size += sizeof(uintX_t) + CBA.writeULEB128(NumBlocks);
+-    // Write all BBEntries.
+-    if (E.BBEntries) {
+-      for (const ELFYAML::BBAddrMapEntry::BBEntry &BBE : *E.BBEntries) {
++    if (!E.BBRanges)
++      continue;
++    uint64_t TotalNumBlocks = 0;
++    for (const ELFYAML::BBAddrMapEntry::BBRangeEntry &BBR : *E.BBRanges) {
++      // Write the base address of the range.
++      CBA.write<uintX_t>(BBR.BaseAddress, ELFT::TargetEndianness);
++      // Write number of BBEntries (number of basic blocks in this basic block
++      // range). This is overridden by the 'NumBlocks' YAML field when
++      // specified.
++      uint64_t NumBlocks =
++          BBR.NumBlocks.value_or(BBR.BBEntries ? BBR.BBEntries->size() : 0);
++      SHeader.sh_size += sizeof(uintX_t) + CBA.writeULEB128(NumBlocks);
++      // Write all BBEntries in this BBRange.
++      if (!BBR.BBEntries)
++        continue;
++      for (const ELFYAML::BBAddrMapEntry::BBEntry &BBE : *BBR.BBEntries) {
++        ++TotalNumBlocks;
+         if (Section.Type == llvm::ELF::SHT_LLVM_BB_ADDR_MAP && E.Version > 1)
+           SHeader.sh_size += CBA.writeULEB128(BBE.ID);
+         SHeader.sh_size += CBA.writeULEB128(BBE.AddressOffset);
+@@ -1444,7 +1463,6 @@ void ELFState<ELFT>::writeSectionContent(
+         SHeader.sh_size += CBA.writeULEB128(BBE.Metadata);
+       }
+     }
+-
+     if (!PGOAnalyses)
+       continue;
+     const ELFYAML::PGOAnalysisMapEntry &PGOEntry = PGOAnalyses->at(Idx);
+@@ -1456,11 +1474,11 @@ void ELFState<ELFT>::writeSectionContent(
+       continue;
+ 
+     const auto &PGOBBEntries = PGOEntry.PGOBBEntries.value();
+-    if (!E.BBEntries || E.BBEntries->size() != PGOBBEntries.size()) {
++    if (TotalNumBlocks != PGOBBEntries.size()) {
+       WithColor::warning() << "PBOBBEntries must be the same length as "
+                               "BBEntries in SHT_LLVM_BB_ADDR_MAP.\n"
+                            << "Mismatch on function with address: "
+-                           << E.Address;
++                           << E.getFunctionAddress();
+       continue;
+     }
+ 
+diff --git a/llvm/lib/ObjectYAML/ELFYAML.cpp b/llvm/lib/ObjectYAML/ELFYAML.cpp
+index 6ad4a067415a..31e90fea6e46 100644
+--- a/llvm/lib/ObjectYAML/ELFYAML.cpp
++++ b/llvm/lib/ObjectYAML/ELFYAML.cpp
+@@ -1680,7 +1680,6 @@ void MappingTraits<std::unique_ptr<ELFYAML::Chunk>>::mapping(
+       Section.reset(new ELFYAML::CallGraphProfileSection());
+     sectionMapping(IO, *cast<ELFYAML::CallGraphProfileSection>(Section.get()));
+     break;
+-  case ELF::SHT_LLVM_BB_ADDR_MAP_V0:
+   case ELF::SHT_LLVM_BB_ADDR_MAP:
+     if (!IO.outputting())
+       Section.reset(new ELFYAML::BBAddrMapSection());
+@@ -1812,7 +1811,13 @@ void MappingTraits<ELFYAML::BBAddrMapEntry>::mapping(
+   assert(IO.getContext() && "The IO context is not initialized");
+   IO.mapRequired("Version", E.Version);
+   IO.mapOptional("Feature", E.Feature, Hex8(0));
+-  IO.mapOptional("Address", E.Address, Hex64(0));
++  IO.mapOptional("NumBBRanges", E.NumBBRanges);
++  IO.mapOptional("BBRanges", E.BBRanges);
++}
++
++void MappingTraits<ELFYAML::BBAddrMapEntry::BBRangeEntry>::mapping(
++    IO &IO, ELFYAML::BBAddrMapEntry::BBRangeEntry &E) {
++  IO.mapOptional("BaseAddress", E.BaseAddress, Hex64(0));
+   IO.mapOptional("NumBlocks", E.NumBlocks);
+   IO.mapOptional("BBEntries", E.BBEntries);
+ }
+diff --git a/llvm/test/CodeGen/X86/basic-block-sections-labels-functions-sections.ll b/llvm/test/CodeGen/X86/basic-block-address-map-function-sections.ll
+similarity index 94%
+rename from llvm/test/CodeGen/X86/basic-block-sections-labels-functions-sections.ll
+rename to llvm/test/CodeGen/X86/basic-block-address-map-function-sections.ll
+index 3be3ab70f8a6..d7678604cffa 100644
+--- a/llvm/test/CodeGen/X86/basic-block-sections-labels-functions-sections.ll
++++ b/llvm/test/CodeGen/X86/basic-block-address-map-function-sections.ll
+@@ -1,4 +1,5 @@
+ ; RUN: llc < %s -mtriple=x86_64 -function-sections -basic-block-sections=labels | FileCheck %s
++; RUN: llc < %s -mtriple=x86_64 -function-sections -basic-block-address-map | FileCheck %s
+ 
+ $_Z4fooTIiET_v = comdat any
+ 
+diff --git a/llvm/test/CodeGen/X86/basic-block-address-map-with-basic-block-sections.ll b/llvm/test/CodeGen/X86/basic-block-address-map-with-basic-block-sections.ll
+new file mode 100644
+index 000000000000..6354e2ec6889
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/basic-block-address-map-with-basic-block-sections.ll
+@@ -0,0 +1,71 @@
++;; Check that the -basic-block-address-map option works when used along with -basic-block-sections.
++;; Let a function with 4 basic blocks get split into 2 sections.
++; RUN: echo '!_Z3bazb' > %t
++; RUN: echo '!!0 2' >> %t
++; RUN: llc < %s -mtriple=x86_64 -basic-block-address-map -basic-block-sections=%t | FileCheck %s
++
++define void @_Z3bazb(i1 zeroext) personality i32 (...)* @__gxx_personality_v0 {
++  br i1 %0, label %2, label %7
++
++2:
++  %3 = invoke i32 @_Z3barv()
++          to label %7 unwind label %5
++  br label %9
++
++5:
++  landingpad { i8*, i32 }
++          catch i8* null
++  br label %9
++
++7:
++  %8 = call i32 @_Z3foov()
++  br label %9
++
++9:
++  ret void
++}
++
++declare i32 @_Z3barv() #1
++
++declare i32 @_Z3foov() #1
++
++declare i32 @__gxx_personality_v0(...)
++
++; CHECK:		.text
++; CHECK-LABEL:	_Z3bazb:
++; CHECK-LABEL:	.Lfunc_begin0:
++; CHECK-LABEL:	.LBB_END0_0:
++; CHECK-LABEL:	.LBB0_1:
++; CHECK-LABEL:	.LBB_END0_1:
++; CHECK:		.section .text.split._Z3bazb,"ax",@progbits
++; CHECK-LABEL:	_Z3bazb.cold:
++; CHECK-LABEL:	.LBB_END0_2:
++; CHECK-LABEL:	.LBB0_3:
++; CHECK-LABEL:	.LBB_END0_3:
++; CHECK-LABEL:	.Lfunc_end0:
++
++; CHECK:		.section	.llvm_bb_addr_map,"o",@llvm_bb_addr_map,.text.hot._Z3bazb
++; CHECK-NEXT:   .byte   2               # version
++; CHECK-NEXT:   .byte   8               # feature
++; CHECK-NEXT:   .byte   2               # number of basic block ranges
++; CHECK-NEXT:	.quad	.Lfunc_begin0   # base address
++; CHECK-NEXT:	.byte	2               # number of basic blocks
++; CHECK-NEXT:	.byte	0               # BB id
++; CHECK-NEXT:	.uleb128 .Lfunc_begin0-.Lfunc_begin0
++; CHECK-NEXT:	.uleb128 .LBB_END0_0-.Lfunc_begin0
++; CHECK-NEXT:	.byte	0
++; CHECK-NEXT:	.byte	2               # BB id
++; CHECK-NEXT:	.uleb128 .LBB0_1-.LBB_END0_0
++; CHECK-NEXT:	.uleb128 .LBB_END0_1-.LBB0_1
++; CHECK-NEXT:	.byte	5
++; CHECK-NEXT:	.quad	_Z3bazb.cold    # base address
++; CHECK-NEXT:	.byte	2               # number of basic blocks
++; CHECK-NEXT:	.byte	1               # BB id
++; CHECK-NEXT:	.uleb128 _Z3bazb.cold-_Z3bazb.cold
++; CHECK-NEXT:	.uleb128 .LBB_END0_2-_Z3bazb.cold
++; CHECK-NEXT:	.byte	8
++; CHECK-NEXT:	.byte	3               # BB id
++; CHECK-NEXT:	.uleb128 .LBB0_3-.LBB_END0_2
++; CHECK-NEXT:	.uleb128 .LBB_END0_3-.LBB0_3
++; CHECK-NEXT:	.byte	1
++
+diff --git a/llvm/test/CodeGen/X86/basic-block-address-map-with-mfs.ll b/llvm/test/CodeGen/X86/basic-block-address-map-with-mfs.ll
+new file mode 100644
+index 000000000000..2565db23c024
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/basic-block-address-map-with-mfs.ll
+@@ -0,0 +1,89 @@
++; COM: Emitting basic-block-address-map when machine function splitting is enabled.
++; RUN: llc < %s -mtriple=x86_64 -function-sections -split-machine-functions -basic-block-address-map | FileCheck %s --check-prefixes=CHECK,BASIC
++
++; COM: Emitting basic-block-address-map with PGO analysis with machine function splitting enabled.
++; RUN: llc < %s -mtriple=x86_64 -function-sections -split-machine-functions -basic-block-address-map -pgo-analysis-map=func-entry-count,bb-freq,br-prob | FileCheck %s --check-prefixes=CHECK,PGO
++
++define void @foo(i1 zeroext %0) nounwind !prof !14 {
++  br i1 %0, label %2, label %4, !prof !15
++
++2:                                                ; preds = %1
++  %3 = call i32 @bar()
++  br label %6
++
++4:                                                ; preds = %1
++  %5 = call i32 @baz()
++  br label %6
++
++6:                                                ; preds = %4, %2
++  %7 = tail call i32 @qux()
++  ret void
++}
++
++declare i32 @bar()
++declare i32 @baz()
++declare i32 @qux()
++
++!llvm.module.flags = !{!0}
++!0 = !{i32 1, !"ProfileSummary", !1}
++!1 = !{!2, !3, !4, !5, !6, !7, !8, !9}
++!2 = !{!"ProfileFormat", !"InstrProf"}
++!3 = !{!"TotalCount", i64 10000}
++!4 = !{!"MaxCount", i64 10}
++!5 = !{!"MaxInternalCount", i64 1}
++!6 = !{!"MaxFunctionCount", i64 1000}
++!7 = !{!"NumCounts", i64 3}
++!8 = !{!"NumFunctions", i64 5}
++!9 = !{!"DetailedSummary", !10}
++!10 = !{!11, !12, !13}
++!11 = !{i32 10000, i64 100, i32 1}
++!12 = !{i32 999900, i64 100, i32 1}
++!13 = !{i32 999999, i64 1, i32 2}
++!14 = !{!"function_entry_count", i64 7000}
++!15 = !{!"branch_weights", i32 7000, i32 0}
++
++; CHECK:          .section .text.hot.foo,"ax",@progbits
++; CHECK-LABEL:  foo:
++; CHECK-LABEL:  .Lfunc_begin0:
++; CHECK-LABEL:  .LBB_END0_0:
++; CHECK-LABEL:  .LBB0_1:
++; CHECK-LABEL:  .LBB_END0_1:
++; CHECK:          .section .text.split.foo,"ax",@progbits
++; CHECK-LABEL:  foo.cold:
++; CHECK-LABEL:  .LBB_END0_2:
++; CHECK-LABEL:  .Lfunc_end0:
++
++; CHECK:                .section        .llvm_bb_addr_map,"o",@llvm_bb_addr_map,.text.hot.foo
++; CHECK-NEXT:   .byte   2               # version
++; BASIC-NEXT:   .byte   8               # feature
++; PGO-NEXT:     .byte   15              # feature
++; CHECK-NEXT:   .byte   2               # number of basic block ranges
++; CHECK-NEXT:   .quad   .Lfunc_begin0   # base address
++; CHECK-NEXT:   .byte   2               # number of basic blocks
++; CHECK-NEXT:   .byte   0               # BB id
++; CHECK-NEXT:   .uleb128 .Lfunc_begin0-.Lfunc_begin0
++; CHECK-NEXT:   .uleb128 .LBB_END0_0-.Lfunc_begin0
++; CHECK-NEXT:   .byte   8
++; CHECK-NEXT:   .byte   1               # BB id
++; CHECK-NEXT:   .uleb128 .LBB0_1-.LBB_END0_0
++; CHECK-NEXT:   .uleb128 .LBB_END0_1-.LBB0_1
++; CHECK-NEXT:   .byte   3
++; CHECK-NEXT:   .quad   foo.cold    # base address
++; CHECK-NEXT:   .byte   1               # number of basic blocks
++; CHECK-NEXT:   .byte   2               # BB id
++; CHECK-NEXT:   .uleb128 foo.cold-foo.cold
++; CHECK-NEXT:   .uleb128 .LBB_END0_2-foo.cold
++; CHECK-NEXT:   .byte   3
++
++;; PGO Analysis Map
++; PGO:         .ascii  "\3306"                            # function entry count
++; PGO-NEXT:    .ascii  "\200\200\200\200\200\200\200 "    # basic block frequency
++; PGO-NEXT:    .byte   2                                  # basic block successor count
++; PGO-NEXT:    .byte   1                                  # successor BB ID
++; PGO-NEXT:    .ascii  "\200\200\200\200\b"               # successor branch probability
++; PGO-NEXT:    .byte   2                                  # successor BB ID
++; PGO-NEXT:    .byte   0                                  # successor branch probability
++; PGO-NEXT:    .ascii  "\200\200\200\374\377\377\377\037" # basic block frequency
++; PGO-NEXT:    .byte   0		                       # basic block successor count
++; PGO-NEXT:    .ascii  "\200\200\200\004"                 # basic block frequency
++; PGO-NEXT:    .byte   0                                  # basic block successor count
+diff --git a/llvm/test/CodeGen/X86/basic-block-sections-labels.ll b/llvm/test/CodeGen/X86/basic-block-address-map.ll
+similarity index 90%
+rename from llvm/test/CodeGen/X86/basic-block-sections-labels.ll
+rename to llvm/test/CodeGen/X86/basic-block-address-map.ll
+index 0b0b00a0b981..6ab24b494936 100644
+--- a/llvm/test/CodeGen/X86/basic-block-sections-labels.ll
++++ b/llvm/test/CodeGen/X86/basic-block-address-map.ll
+@@ -1,5 +1,7 @@
+ ; Check the basic block sections labels option
++; RUN: llc < %s -mtriple=x86_64 -function-sections -unique-section-names=true -basic-block-address-map | FileCheck %s --check-prefixes=CHECK,UNIQ
+ ; RUN: llc < %s -mtriple=x86_64 -function-sections -unique-section-names=true -basic-block-sections=labels | FileCheck %s --check-prefixes=CHECK,UNIQ
++; RUN: llc < %s -mtriple=x86_64 -function-sections -unique-section-names=false -basic-block-address-map | FileCheck %s --check-prefixes=CHECK,NOUNIQ
+ ; RUN: llc < %s -mtriple=x86_64 -function-sections -unique-section-names=false -basic-block-sections=labels | FileCheck %s --check-prefixes=CHECK,NOUNIQ
+ ; RUN: llc < %s -mtriple=x86_64 -function-sections -unique-section-names=true -basic-block-sections=labels -split-machine-functions | FileCheck %s --check-prefixes=CHECK,UNIQ
+ 
+diff --git a/llvm/test/tools/llvm-objdump/X86/elf-bbaddrmap-disassemble-symbolize-operands.yaml b/llvm/test/tools/llvm-objdump/X86/elf-bbaddrmap-disassemble-symbolize-operands.yaml
+index 6864932411ae..cc7faea67bed 100644
+--- a/llvm/test/tools/llvm-objdump/X86/elf-bbaddrmap-disassemble-symbolize-operands.yaml
++++ b/llvm/test/tools/llvm-objdump/X86/elf-bbaddrmap-disassemble-symbolize-operands.yaml
+@@ -1,30 +1,32 @@
+ ## Test that in the presence of SHT_LLVM_BB_ADDR_MAP sections,
+ ## --symbolize-operands can display <BB*> labels.
+ 
+-## Executable object file.
+-# RUN: yaml2obj --docnum=1 -DFOO_ADDR=0x4000 -DBAR_ADDR=0x5000 %s -o %t1
+-# RUN: llvm-objdump %t1 -d --symbolize-operands -M intel --no-show-raw-insn --no-leading-addr | \
+-# RUN:   FileCheck %s -DSYM=symbol --match-full-lines --check-prefixes=INTEL
+-# RUN: llvm-objdump %t1 -d --symbolize-operands -M att --no-show-raw-insn --no-leading-addr | \
+-# RUN:   FileCheck %s -DSYM=symbol --match-full-lines --check-prefixes=ATT
++## Executable object file with separate SHT_LLVM_BB_ADDR_MAP sections for multiple text sections.
++## RUN: yaml2obj --docnum=1 %s -o %t1
++## RUN: llvm-objdump %t1 -d --symbolize-operands -M intel --no-show-raw-insn --no-leading-addr | \
++## RUN:   FileCheck %s --match-full-lines --check-prefixes=INTEL
++## RUN: llvm-objdump %t1 -d --symbolize-operands -M att --no-show-raw-insn --no-leading-addr | \
++## RUN:   FileCheck %s --match-full-lines --check-prefixes=ATT
+ 
+ ## Executable object file with a single SHT_LLVM_BB_ADDR_MAP for multiple text sections.
+-# RUN: yaml2obj --docnum=2 %s -o %t3
+-# RUN: llvm-objdump %t3 -d --symbolize-operands -M intel --no-show-raw-insn --no-leading-addr | \
+-# RUN:   FileCheck %s -DSYM=symbol --match-full-lines --check-prefixes=INTEL
+-# RUN: llvm-objdump %t3 -d --symbolize-operands -M att --no-show-raw-insn --no-leading-addr | \
+-# RUN:   FileCheck %s -DSYM=symbol --match-full-lines --check-prefixes=ATT
++# RUN: yaml2obj --docnum=2 %s -o %t2
++# RUN: llvm-objdump %t2 -d --symbolize-operands -M intel --no-show-raw-insn --no-leading-addr | \
++# RUN:   FileCheck %s --match-full-lines --check-prefixes=INTEL
++# RUN: llvm-objdump %t2 -d --symbolize-operands -M att --no-show-raw-insn --no-leading-addr | \
++# RUN:   FileCheck %s --match-full-lines --check-prefixes=ATT
+ 
+ ## Expect to find the branch and basic block labels and global variable name.
+ # ATT:      <foo>:
+ # ATT-NEXT: <BB3>:
+ # ATT-NEXT:   pushq %rax
+ # ATT-NEXT: <BB1>:
+-# ATT-NEXT:   cmpl  , %eax <[[SYM]]>
++# ATT-NEXT:   cmpl  , %eax <symbol>
+ # ATT-NEXT:   nop
+ # ATT-NEXT: <BB2>:
+ # ATT-NEXT:   jge    <BB5>
+ # ATT-NEXT:   jmp    <BB1>
++# ATT-NEXT: <BB4>:
++# ATT-NEXT:   jge   <foo.cold>
+ # ATT-NEXT: <BB5>:
+ # ATT-NEXT:   retq
+ # ATT:      <bar>:
+@@ -37,16 +39,21 @@
+ # ATT-NEXT: <BB2>:
+ # ATT-NEXT:   callq  <bar>
+ # ATT-NEXT:   retq
++# ATT:      <foo.cold>:
++# ATT-NEXT: <BB6>:
++# ATT-NEXT:   retq
+ 
+ # INTEL:      <foo>:
+ # INTEL-NEXT: <BB3>:
+ # INTEL-NEXT:   push rax
+ # INTEL-NEXT: <BB1>:
+-# INTEL-NEXT:   cmp  eax, dword ptr <[[SYM]]>
++# INTEL-NEXT:   cmp  eax, dword ptr <symbol>
+ # INTEL-NEXT:   nop
+ # INTEL-NEXT: <BB2>:
+ # INTEL-NEXT:   jge   <BB5>
+ # INTEL-NEXT:   jmp   <BB1>
++# INTEL-NEXT: <BB4>:
++# INTEL-NEXT:   jge   <foo.cold>
+ # INTEL-NEXT: <BB5>:
+ # INTEL-NEXT:   ret
+ # INTEL:      <bar>:
+@@ -59,6 +66,9 @@
+ # INTEL-NEXT: <BB2>:
+ # INTEL-NEXT:   call  <bar>
+ # INTEL-NEXT:   ret
++# INTEL:      <foo.cold>:
++# INTEL-NEXT: <BB6>:
++# INTEL-NEXT:   ret
+ 
+ ## This object file contains a separate text section and SHT_LLVM_BB_ADDR_MAP
+ ## section for each of the two functions foo and bar.
+@@ -73,68 +83,89 @@ FileHeader:
+ Sections:
+   - Name:    .text.foo
+     Type:    SHT_PROGBITS
+-    Address: [[FOO_ADDR]]
++    Address: 0x4000
+     Flags:   [SHF_ALLOC, SHF_EXECINSTR]
+-    Content: '503b0505200000907d02ebf5c3'
++    Content: '503b0505300000907d08ebf50f8dee1f0000c3'
+   - Name:    .text.bar
+     Type:    SHT_PROGBITS
+-    Address: [[BAR_ADDR]]
++    Address: 0x5000
+     Flags:   [SHF_ALLOC, SHF_EXECINSTR]
+     Content: '5089d0740231f6e8f4ffffffc3'
++  - Name:    .text.split
++    Type:    SHT_PROGBITS
++    Address: 0x6000
++    Flags:   [SHF_ALLOC, SHF_EXECINSTR]
++    Content: 'c3'
+   - Name:    .data
+     Type:    SHT_PROGBITS
+     Flags:   [SHF_ALLOC, SHF_WRITE]
+-    Address: 0x6000
++    Address: 0x7000
+   - Name:   .llvm_bb_addr_map.foo
+     Type:   SHT_LLVM_BB_ADDR_MAP
+     Link:   .text.foo
+     Entries:
+       - Version: 2
+-        Address: [[FOO_ADDR]]
+-        BBEntries:
+-          - ID:            3
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x1
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x6
+-            Metadata:      0x0
+-          - ID:            2
+-            AddressOffset: 0x1
+-            Size:          0x4
+-            Metadata:      0x0
+-          - ID:            5
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++        Feature: 0x8
++        BBRanges:
++          - BaseAddress: 0x4000
++            BBEntries:
++             - ID:            3
++               AddressOffset: 0x0
++               Size:          0x1
++               Metadata:      0x1
++             - ID:            1
++               AddressOffset: 0x0
++               Size:          0x6
++               Metadata:      0x0
++             - ID:            2
++               AddressOffset: 0x1
++               Size:          0x4
++               Metadata:      0x0
++             - ID:            4
++               AddressOffset: 0x0
++               Size:          0x6
++               Metadata:      0x1
++             - ID:            5
++               AddressOffset: 0x0
++               Size:          0x1
++               Metadata:      0x2
++          - BaseAddress: 0x6000
++            BBEntries:
++             - ID:            6
++               AddressOffset: 0x0
++               Size:          0x1
++               Metadata:      0x2
+   - Name:   .llvm_bb_addr_map.bar
+     Type:   SHT_LLVM_BB_ADDR_MAP
+     Link:   .text.bar
+     Entries:
+       - Version: 1
+-        Address: [[BAR_ADDR]]
+-        BBEntries:
+-          - AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x1
+-          - AddressOffset: 0x4
+-            Size:          0x2
+-            Metadata:      0x0
+-          - AddressOffset: 0x0
+-            Size:          0x6
+-            Metadata:      0x0
++        BBRanges:
++         - BaseAddress: 0x5000
++           BBEntries:
++            - AddressOffset: 0x0
++              Size:          0x1
++              Metadata:      0x1
++            - AddressOffset: 0x4
++              Size:          0x2
++              Metadata:      0x0
++            - AddressOffset: 0x0
++              Size:          0x6
++              Metadata:      0x0
+ 
+ Symbols:
+   - Name:    foo
+     Section: .text.foo
+-    Value:   [[FOO_ADDR]]
++    Value:   0x4000
++  - Name:    foo.cold
++    Section: .text.split
++    Value:   0x6000
+   - Name:    bar
+     Section: .text.bar
+-    Value:   [[BAR_ADDR]]
++    Value:   0x5000
+   - Name:    symbol
+     Section: .data
+-    Value:   0x600c
++    Value:   0x700c
+ 
+ ## This object file contains a single SHT_LLVM_BB_ADDR_MAP for two text
+ ## sections .text.foo and .text.bar.
+@@ -149,59 +180,80 @@ Sections:
+     Type:    SHT_PROGBITS
+     Address: 0x4000
+     Flags:   [SHF_ALLOC, SHF_EXECINSTR]
+-    Content: '503b0505200000907d02ebf5c3'
++    Content: '503b0505300000907d08ebf50f8dee1f0000c3'
+   - Name:    .text.bar
+     Type:    SHT_PROGBITS
+     Address: 0x5000
+     Flags:   [SHF_ALLOC, SHF_EXECINSTR]
+     Content: '5089d0740231f6e8f4ffffffc3'
++  - Name:    .text.split
++    Type:    SHT_PROGBITS
++    Address: 0x6000
++    Flags:   [SHF_ALLOC, SHF_EXECINSTR]
++    Content: 'c3'
+   - Name:    .data
+     Type:    SHT_PROGBITS
+     Flags:   [SHF_ALLOC, SHF_WRITE]
+-    Address: 0x6000
++    Address: 0x7000
+   - Name:   .llvm_bb_addr_map.foo
+     Type:   SHT_LLVM_BB_ADDR_MAP
+     Link:   .text.foo
+     Entries:
+       - Version: 2
+-        Address: 0x4000
+-        BBEntries:
+-          - ID:            3
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x1
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x6
+-            Metadata:      0x0
+-          - ID:            2
+-            AddressOffset: 0x1
+-            Size:          0x4
+-            Metadata:      0x0
+-          - ID:            5
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++        Feature: 0x8
++        BBRanges:
++          - BaseAddress: 0x4000
++            BBEntries:
++             - ID:            3
++               AddressOffset: 0x0
++               Size:          0x1
++               Metadata:      0x1
++             - ID:            1
++               AddressOffset: 0x0
++               Size:          0x6
++               Metadata:      0x0
++             - ID:            2
++               AddressOffset: 0x1
++               Size:          0x4
++               Metadata:      0x0
++             - ID:            4
++               AddressOffset: 0x0
++               Size:          0x6
++               Metadata:      0x1
++             - ID:            5
++               AddressOffset: 0x0
++               Size:          0x1
++               Metadata:      0x2
++          - BaseAddress: 0x6000
++            BBEntries:
++             - ID:            6
++               AddressOffset: 0x0
++               Size:          0x1
++               Metadata:      0x2
+       - Version: 1
+-        Address: 0x5000
+-        BBEntries:
+-          - AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x1
+-          - AddressOffset: 0x4
+-            Size:          0x2
+-            Metadata:      0x0
+-          - AddressOffset: 0x0
+-            Size:          0x6
+-            Metadata:      0x0
++        BBRanges:
++         - BaseAddress: 0x5000
++           BBEntries:
++            - AddressOffset: 0x0
++              Size:          0x1
++              Metadata:      0x1
++            - AddressOffset: 0x4
++              Size:          0x2
++              Metadata:      0x0
++            - AddressOffset: 0x0
++              Size:          0x6
++              Metadata:      0x0
+ 
+ Symbols:
+   - Name:    foo
+     Section: .text.foo
+     Value:   0x4000
++  - Name:    foo.cold
++    Section: .text.split
++    Value:   0x6000
+   - Name:    bar
+     Section: .text.bar
+     Value:   0x5000
+   - Name:    symbol
+     Section: .data
+-    Value:   0x600c
++    Value:   0x700c
+diff --git a/llvm/test/tools/llvm-objdump/X86/elf-bbaddrmap-symbolize-relocatable.yaml b/llvm/test/tools/llvm-objdump/X86/elf-bbaddrmap-symbolize-relocatable.yaml
+index f796963481cd..706d386e467e 100644
+--- a/llvm/test/tools/llvm-objdump/X86/elf-bbaddrmap-symbolize-relocatable.yaml
++++ b/llvm/test/tools/llvm-objdump/X86/elf-bbaddrmap-symbolize-relocatable.yaml
+@@ -24,17 +24,32 @@ Sections:
+     Link:    .text
+     Entries:
+       - Version: 2
+-        BBEntries:
+-          - ID:              0
+-            AddressOffset:   0x0
+-            Size:            0x1
+-            Metadata:        0x1
++        BBRanges:
++          - BBEntries:
++             - ID:              0
++               AddressOffset:   0x0
++               Size:            0x1
++               Metadata:        0xa
+       - Version: 2
+-        BBEntries:
+-          - ID:              0
+-            AddressOffset:   0x0
+-            Size:            0x1
+-            Metadata:        0x1
++        BBRanges:
++          - BBEntries:
++            - ID:              0
++              AddressOffset:   0x0
++              Size:            0x1
++              Metadata:        0xb
++      - Version: 2
++        Feature: 0x8
++        BBRanges:
++          - BBEntries:
++            - ID:              0
++              AddressOffset:   0x0
++              Size:            0x1
++              Metadata:        0xc
++          - BBEntries:
++            - ID:              1
++              AddressOffset:   0x0
++              Size:            0x1
++              Metadata:        0xd
+   - Name:  .rela.llvm_bb_addr_map
+     Type:  SHT_RELA
+     Flags: [ SHF_INFO_LINK ]
+@@ -48,6 +63,15 @@ Sections:
+         Symbol: .text
+         Type:   R_X86_64_64
+         Addend: 1
++      - Offset: 0x21
++        Symbol: .text
++        Type:   R_X86_64_64
++        Addend: 0x2
++      - Offset: 0x2e
++        Symbol: .text
++        Type:   R_X86_64_64
++        Addend: 0x3
++
+ Symbols:
+   - Name:    a
+     Section: .text
+@@ -55,6 +79,12 @@ Symbols:
+   - Name:    c
+     Section: .text
+     Value:   0x1
++  - Name:    h
++    Section: .text
++    Value:   0x2
++  - Name:    h1
++    Section: .text
++    Value:   0x3
+   - Name:    .text
+     Type:    STT_SECTION
+     Section: .text
+diff --git a/llvm/test/tools/llvm-objdump/X86/elf-pgoanalysismap.yaml b/llvm/test/tools/llvm-objdump/X86/elf-pgoanalysismap.yaml
+index c4bf443f920a..732fab3e2a37 100644
+--- a/llvm/test/tools/llvm-objdump/X86/elf-pgoanalysismap.yaml
++++ b/llvm/test/tools/llvm-objdump/X86/elf-pgoanalysismap.yaml
+@@ -25,13 +25,14 @@ Sections:
+     Link:   .text.foo
+     Entries:
+       - Version: 2
+-        Address: 0x0
+         Feature: 0x1
+-        BBEntries:
+-          - ID:            3
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x1
++        BBRanges:
++          - BaseAddress: 0x0
++            BBEntries:
++              - ID:            3
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x1
+     PGOAnalyses:
+       - FuncEntryCount: 1000
+ Symbols:
+@@ -65,25 +66,26 @@ Sections:
+     Link:   .text.foo
+     Entries:
+       - Version: 2
+-        Address: 0x0
+         Feature: 0x3
+-        BBEntries:
+-          - ID:            3
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x1
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x6
+-            Metadata:      0x0
+-          - ID:            2
+-            AddressOffset: 0x1
+-            Size:          0x4
+-            Metadata:      0x0
+-          - ID:            5
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++        BBRanges:
++          - BaseAddress: 0x0
++            BBEntries:
++              - ID:            3
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x1
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x6
++                Metadata:      0x0
++              - ID:            2
++                AddressOffset: 0x1
++                Size:          0x4
++                Metadata:      0x0
++              - ID:            5
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+     PGOAnalyses:
+       - FuncEntryCount: 1000
+         PGOBBEntries:
+@@ -126,25 +128,26 @@ Sections:
+     Link:   .text.foo
+     Entries:
+       - Version: 2
+-        Address: 0x0
+         Feature: 0x7
+-        BBEntries:
+-          - ID:            3
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x1
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x6
+-            Metadata:      0x0
+-          - ID:            2
+-            AddressOffset: 0x1
+-            Size:          0x4
+-            Metadata:      0x0
+-          - ID:            5
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++        BBRanges:
++          - BaseAddress: 0x0
++            BBEntries:
++              - ID:            3
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x1
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x6
++                Metadata:      0x0
++              - ID:            2
++                AddressOffset: 0x1
++                Size:          0x4
++                Metadata:      0x0
++              - ID:            5
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+     PGOAnalyses:
+       - FuncEntryCount: 1000
+         PGOBBEntries:
+diff --git a/llvm/test/tools/llvm-readobj/ELF/bb-addr-map-pgo-analysis-map.test b/llvm/test/tools/llvm-readobj/ELF/bb-addr-map-pgo-analysis-map.test
+index 91b3d7e3902e..e5a9400c670c 100644
+--- a/llvm/test/tools/llvm-readobj/ELF/bb-addr-map-pgo-analysis-map.test
++++ b/llvm/test/tools/llvm-readobj/ELF/bb-addr-map-pgo-analysis-map.test
+@@ -24,26 +24,31 @@
+ # CHECK-NEXT:     At: [[ADDR]]
+ # CHECK-NEXT: warning: '[[FILE]]': could not identify function symbol for address ([[ADDR]]) in SHT_LLVM_BB_ADDR_MAP section with index 3
+ # CHECK-NEXT:     Name: <?>
+-# CHECK-NEXT:     BB entries [
++# CHECK-NEXT:     BB Ranges [
+ # CHECK-NEXT:       {
+-# CHECK-NEXT:         ID: 0
+-# CHECK-NEXT:         Offset: 0x0
+-# CHECK-NEXT:         Size: 0x1
+-# CHECK-NEXT:         HasReturn: No
+-# CHECK-NEXT:         HasTailCall: Yes
+-# CHECK-NEXT:         IsEHPad: No
+-# CHECK-NEXT:         CanFallThrough: No
+-# CHECK-NEXT:         HasIndirectBranch: No
+-# CHECK-NEXT:       }
+-# CHECK-NEXT:       {
+-# CHECK-NEXT:         ID: 2
+-# CHECK-NEXT:         Offset: 0x4
+-# CHECK-NEXT:         Size: 0x4
+-# CHECK-NEXT:         HasReturn: Yes
+-# CHECK-NEXT:         HasTailCall: No
+-# CHECK-NEXT:         IsEHPad: Yes
+-# CHECK-NEXT:         CanFallThrough: No
+-# CHECK-NEXT:         HasIndirectBranch: Yes
++# CHECK-NEXT:         Base Address: [[ADDR]]
++# CHECK-NEXT:         BB Entries [
++# CHECK-NEXT:           {
++# CHECK-NEXT:             ID: 0
++# CHECK-NEXT:             Offset: 0x0
++# CHECK-NEXT:             Size: 0x1
++# CHECK-NEXT:             HasReturn: No
++# CHECK-NEXT:             HasTailCall: Yes
++# CHECK-NEXT:             IsEHPad: No
++# CHECK-NEXT:             CanFallThrough: No
++# CHECK-NEXT:             HasIndirectBranch: No
++# CHECK-NEXT:           }
++# CHECK-NEXT:           {
++# CHECK-NEXT:             ID: 2
++# CHECK-NEXT:             Offset: 0x4
++# CHECK-NEXT:             Size: 0x4
++# CHECK-NEXT:             HasReturn: Yes
++# CHECK-NEXT:             HasTailCall: No
++# CHECK-NEXT:             IsEHPad: Yes
++# CHECK-NEXT:             CanFallThrough: No
++# CHECK-NEXT:             HasIndirectBranch: Yes
++# CHECK-NEXT:           }
++# CHECK-NEXT:         ]
+ # CHECK-NEXT:       }
+ # CHECK-NEXT:     ]
+ # CHECK-NEXT:     PGO analyses {
+@@ -69,16 +74,21 @@
+ # CHECK-NEXT:   Function {
+ # CHECK-NEXT:     At: 0x22222
+ # CHECK-NEXT:     Name: foo
+-# CHECK-NEXT:     BB entries [
++# CHECK-NEXT:     BB Ranges [
+ # CHECK-NEXT:       {
+-# CHECK-NEXT:         ID: 4
+-# CHECK-NEXT:         Offset: 0x6
+-# CHECK-NEXT:         Size: 0x7
+-# CHECK-NEXT:         HasReturn: No
+-# CHECK-NEXT:         HasTailCall: No
+-# CHECK-NEXT:         IsEHPad: No
+-# CHECK-NEXT:         CanFallThrough: Yes
+-# CHECK-NEXT:         HasIndirectBranch: No
++# CHECK-NEXT:         Base Address: 0x22222
++# CHECK-NEXT:         BB Entries [
++# CHECK-NEXT:           {
++# CHECK-NEXT:             ID: 4
++# CHECK-NEXT:             Offset: 0x6
++# CHECK-NEXT:             Size: 0x7
++# CHECK-NEXT:             HasReturn: No
++# CHECK-NEXT:             HasTailCall: No
++# CHECK-NEXT:             IsEHPad: No
++# CHECK-NEXT:             CanFallThrough: Yes
++# CHECK-NEXT:             HasIndirectBranch: No
++# CHECK-NEXT:           }
++# CHECK-NEXT:         ]
+ # CHECK-NEXT:       }
+ # CHECK-NEXT:     ]
+ # CHECK-NEXT:     PGO analyses {
+@@ -102,26 +112,31 @@
+ # TRUNCATED-NEXT:   Function {
+ # TRUNCATED-NEXT:     At: 0x33333
+ # TRUNCATED-NEXT:     Name: bar
+-# TRUNCATED-NEXT:     BB entries [
+-# TRUNCATED-NEXT:       {
+-# TRUNCATED-NEXT:         ID: 6
+-# TRUNCATED-NEXT:         Offset: 0x9
+-# TRUNCATED-NEXT:         Size: 0xA
+-# TRUNCATED-NEXT:         HasReturn: Yes
+-# TRUNCATED-NEXT:         HasTailCall: Yes
+-# TRUNCATED-NEXT:         IsEHPad: No
+-# TRUNCATED-NEXT:         CanFallThrough: Yes
+-# TRUNCATED-NEXT:         HasIndirectBranch: Yes
+-# TRUNCATED-NEXT:       }
++# TRUNCATED-NEXT:     BB Ranges [
+ # TRUNCATED-NEXT:       {
+-# TRUNCATED-NEXT:         ID: 7
+-# TRUNCATED-NEXT:         Offset: 0x1F
+-# TRUNCATED-NEXT:         Size: 0xD
+-# TRUNCATED-NEXT:         HasReturn: No
+-# TRUNCATED-NEXT:         HasTailCall: Yes
+-# TRUNCATED-NEXT:         IsEHPad: Yes
+-# TRUNCATED-NEXT:         CanFallThrough: Yes
+-# TRUNCATED-NEXT:         HasIndirectBranch: No
++# TRUNCATED-NEXT:         Base Address: 0x33333
++# TRUNCATED-NEXT:         BB Entries [
++# TRUNCATED-NEXT:           {
++# TRUNCATED-NEXT:             ID: 6
++# TRUNCATED-NEXT:             Offset: 0x9
++# TRUNCATED-NEXT:             Size: 0xA
++# TRUNCATED-NEXT:             HasReturn: Yes
++# TRUNCATED-NEXT:             HasTailCall: Yes
++# TRUNCATED-NEXT:             IsEHPad: No
++# TRUNCATED-NEXT:             CanFallThrough: Yes
++# TRUNCATED-NEXT:             HasIndirectBranch: Yes
++# TRUNCATED-NEXT:           }
++# TRUNCATED-NEXT:           {
++# TRUNCATED-NEXT:             ID: 7
++# TRUNCATED-NEXT:             Offset: 0x1F
++# TRUNCATED-NEXT:             Size: 0xD
++# TRUNCATED-NEXT:             HasReturn: No
++# TRUNCATED-NEXT:             HasTailCall: Yes
++# TRUNCATED-NEXT:             IsEHPad: Yes
++# TRUNCATED-NEXT:             CanFallThrough: Yes
++# TRUNCATED-NEXT:             HasIndirectBranch: No
++# TRUNCATED-NEXT:           }
++# TRUNCATED-NEXT:         ]
+ # TRUNCATED-NEXT:       }
+ # TRUNCATED-NEXT:     ]
+ # TRUNCATED-NEXT:     PGO analyses {
+@@ -151,24 +166,26 @@ Sections:
+     Entries:
+       - Version: 2
+         Feature: 0x7
+-        Address: [[ADDR=0x11111]]
+-        BBEntries:
+-          - ID:            0
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
+-          - ID:            2
+-            AddressOffset: 0x3
+-            Size:          0x4
+-            Metadata:      0x15
++        BBRanges:
++          - BaseAddress: [[ADDR=0x11111]]
++            BBEntries:
++              - ID:            0
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
++              - ID:            2
++                AddressOffset: 0x3
++                Size:          0x4
++                Metadata:      0x15
+       - Version: 2
+         Feature: 0x3
+-        Address: 0x22222
+-        BBEntries:
+-          - ID:            4
+-            AddressOffset: 0x6
+-            Size:          0x7
+-            Metadata:      0x8
++        BBRanges:
++          - BaseAddress: 0x22222
++            BBEntries:
++              - ID:            4
++                AddressOffset: 0x6
++                Size:          0x7
++                Metadata:      0x8
+     PGOAnalyses:
+       - FuncEntryCount: 100
+         PGOBBEntries:
+@@ -190,16 +207,17 @@ Sections:
+     Entries:
+       - Version: 2
+         Feature: [[FEATURE=0x1]]
+-        Address: 0x33333
+-        BBEntries:
+-          - ID:            6
+-            AddressOffset: 0x9
+-            Size:          0xa
+-            Metadata:      0x1b
+-          - ID:            7
+-            AddressOffset: 0xc
+-            Size:          0xd
+-            Metadata:      0xe
++        BBRanges:
++          - BaseAddress: 0x33333
++            BBEntries:
++              - ID:            6
++                AddressOffset: 0x9
++                Size:          0xa
++                Metadata:      0x1b
++              - ID:            7
++                AddressOffset: 0xc
++                Size:          0xd
++                Metadata:      0xe
+     PGOAnalyses:
+       - FuncEntryCount: 89
+ Symbols:
+diff --git a/llvm/test/tools/llvm-readobj/ELF/bb-addr-map-relocatable.test b/llvm/test/tools/llvm-readobj/ELF/bb-addr-map-relocatable.test
+index e6b6cc344a8e..e7f78491a947 100644
+--- a/llvm/test/tools/llvm-readobj/ELF/bb-addr-map-relocatable.test
++++ b/llvm/test/tools/llvm-readobj/ELF/bb-addr-map-relocatable.test
+@@ -8,32 +8,42 @@
+ # CHECK-NEXT:   Function {
+ # CHECK-NEXT:     At: 0x0
+ # CHECK-NEXT:     Name: <?>
+-# CHECK-NEXT:     BB entries [
++# CHECK-NEXT:     BB Ranges [
+ # CHECK-NEXT:       {
+-# CHECK-NEXT:         ID: 0
+-# CHECK-NEXT:         Offset: 0x0
+-# CHECK-NEXT:         Size: 0xF
+-# CHECK-NEXT:         HasReturn: Yes
+-# CHECK-NEXT:         HasTailCall: No
+-# CHECK-NEXT:         IsEHPad: No
+-# CHECK-NEXT:         CanFallThrough: No
+-# CHECK-NEXT:         HasIndirectBranch: No
++# CHECK-NEXT:         Base Address: 0x0
++# CHECK-NEXT:         BB Entries [
++# CHECK-NEXT:           {
++# CHECK-NEXT:             ID: 0
++# CHECK-NEXT:             Offset: 0x0
++# CHECK-NEXT:             Size: 0xF
++# CHECK-NEXT:             HasReturn: Yes
++# CHECK-NEXT:             HasTailCall: No
++# CHECK-NEXT:             IsEHPad: No
++# CHECK-NEXT:             CanFallThrough: No
++# CHECK-NEXT:             HasIndirectBranch: No
++# CHECK-NEXT:           }
++# CHECK-NEXT:         ]
+ # CHECK-NEXT:       }
+ # CHECK-NEXT:     ]
+ # CHECK-NEXT:   }
+ # CHECK-NEXT:   Function {
+ # CHECK-NEXT:     At: 0x10
+ # CHECK-NEXT:     Name: <?>
+-# CHECK-NEXT:     BB entries [
++# CHECK-NEXT:     BB Ranges [
+ # CHECK-NEXT:       {
+-# CHECK-NEXT:         ID: 0
+-# CHECK-NEXT:         Offset: 0x0
+-# CHECK-NEXT:         Size: 0x11
+-# CHECK-NEXT:         HasReturn: No
+-# CHECK-NEXT:         HasTailCall: No
+-# CHECK-NEXT:         IsEHPad: No
+-# CHECK-NEXT:         CanFallThrough: Yes
+-# CHECK-NEXT:         HasIndirectBranch: No
++# CHECK-NEXT:         Base Address: 0x10
++# CHECK-NEXT:         BB Entries [
++# CHECK-NEXT:           {
++# CHECK-NEXT:             ID: 0
++# CHECK-NEXT:             Offset: 0x0
++# CHECK-NEXT:             Size: 0x11
++# CHECK-NEXT:             HasReturn: No
++# CHECK-NEXT:             HasTailCall: No
++# CHECK-NEXT:             IsEHPad: No
++# CHECK-NEXT:             CanFallThrough: Yes
++# CHECK-NEXT:             HasIndirectBranch: No
++# CHECK-NEXT:           }
++# CHECK-NEXT:         ]
+ # CHECK-NEXT:       }
+ # CHECK-NEXT:     ]
+ # CHECK-NEXT:   }
+@@ -54,17 +64,19 @@ Sections:
+     Link:    .text
+     Entries:
+       - Version: 2
+-        BBEntries:
+-          - ID:              0
+-            AddressOffset:   0x0
+-            Size:            0xF
+-            Metadata:        0x1
++        BBRanges:
++          - BBEntries:
++            - ID:              0
++              AddressOffset:   0x0
++              Size:            0xF
++              Metadata:        0x1
+       - Version: 2
+-        BBEntries:
+-          - ID:              0
+-            AddressOffset:   0x0
+-            Size:            0x11
+-            Metadata:        0x8
++        BBRanges:
++          - BBEntries:
++             - ID:              0
++               AddressOffset:   0x0
++               Size:            0x11
++               Metadata:        0x8
+   - Name:  .rela.llvm_bb_addr_map
+     Type:  SHT_RELA
+     Flags: [ SHF_INFO_LINK ]
+@@ -128,7 +140,8 @@ Sections:
+     Link:    .text
+     Entries:
+       - Version: 2
+-        BBEntries:
++        BBRanges:
++        - BBEntries:
+           - ID:              0
+             AddressOffset:   0x0
+             Size:            0xF
+@@ -181,12 +194,13 @@ Sections:
+     Flags:           [ SHF_LINK_ORDER ]
+     Entries:
+       - Version:         2
+-        Address:         0xF
+-        BBEntries:
+-          - ID:              0
+-            AddressOffset:   0x0
+-            Size:            0xF
+-            Metadata:        0x1
++        BBRanges:
++          - BaseAddress:         0xF
++            BBEntries:
++             - ID:              0
++               AddressOffset:   0x0
++               Size:            0xF
++               Metadata:        0x1
+ 
+ # RUN: yaml2obj %s --docnum=5 -o %t5.o
+ # RUN: llvm-readobj %t5.o --bb-addr-map 2>&1 | FileCheck %s --check-prefix=ET-DYN-NO-WARNING -DFILE=%t5.o
+@@ -195,16 +209,21 @@ Sections:
+ # ET-DYN-NO-WARNING:   Function {
+ # ET-DYN-NO-WARNING:     At: 0xF
+ # ET-DYN-NO-WARNING:     Name: <?>
+-# ET-DYN-NO-WARNING:     BB entries [
++# ET-DYN-NO-WARNING:     BB Ranges [
+ # ET-DYN-NO-WARNING:       {
+-# ET-DYN-NO-WARNING:         ID: 0
+-# ET-DYN-NO-WARNING:         Offset: 0x0
+-# ET-DYN-NO-WARNING:         Size: 0xF
+-# ET-DYN-NO-WARNING:         HasReturn: Yes
+-# ET-DYN-NO-WARNING:         HasTailCall: No
+-# ET-DYN-NO-WARNING:         IsEHPad: No
+-# ET-DYN-NO-WARNING:         CanFallThrough: No
+-# ET-DYN-NO-WARNING:         HasIndirectBranch: No
++# ET-DYN-NO-WARNING:         Base Address: 0xF
++# ET-DYN-NO-WARNING:         BB Entries [
++# ET-DYN-NO-WARNING:           {
++# ET-DYN-NO-WARNING:             ID: 0
++# ET-DYN-NO-WARNING:             Offset: 0x0
++# ET-DYN-NO-WARNING:             Size: 0xF
++# ET-DYN-NO-WARNING:             HasReturn: Yes
++# ET-DYN-NO-WARNING:             HasTailCall: No
++# ET-DYN-NO-WARNING:             IsEHPad: No
++# ET-DYN-NO-WARNING:             CanFallThrough: No
++# ET-DYN-NO-WARNING:             HasIndirectBranch: No
++# ET-DYN-NO-WARNING:           }
++# ET-DYN-NO-WARNING:         ]
+ # ET-DYN-NO-WARNING:       }
+ # ET-DYN-NO-WARNING:     ]
+ # ET-DYN-NO-WARNING:   }
+diff --git a/llvm/test/tools/llvm-readobj/ELF/bb-addr-map.test b/llvm/test/tools/llvm-readobj/ELF/bb-addr-map.test
+index 0593f04d6e30..c5d071c11d1d 100644
+--- a/llvm/test/tools/llvm-readobj/ELF/bb-addr-map.test
++++ b/llvm/test/tools/llvm-readobj/ELF/bb-addr-map.test
+@@ -15,8 +15,8 @@
+ # RUN: llvm-readelf %t1.x32.o --bb-addr-map | FileCheck %s --check-prefix=GNU
+ 
+ ## Check that a malformed section can be handled.
+-# RUN: yaml2obj --docnum=1 %s -DBITS=32 -DSIZE=6 -o %t2.o
+-# RUN: llvm-readobj %t2.o --bb-addr-map 2>&1 | FileCheck %s -DOFFSET=0x00000006 -DFILE=%t2.o --check-prefix=TRUNCATED
++# RUN: yaml2obj --docnum=1 %s -DBITS=32 -DSIZE=7 -o %t2.o
++# RUN: llvm-readobj %t2.o --bb-addr-map 2>&1 | FileCheck %s -DOFFSET=0x00000007 -DFILE=%t2.o --check-prefix=TRUNCATED
+ 
+ ## Check that invalid metadata can be handled.
+ # RUN: yaml2obj --docnum=1 %s -DBITS=32 -DMETADATA=0xF000002 -o %t3.o
+@@ -27,42 +27,57 @@
+ # CHECK-NEXT:     At: [[ADDR]]
+ # CHECK-NEXT: warning: '[[FILE]]': could not identify function symbol for address ([[ADDR]]) in SHT_LLVM_BB_ADDR_MAP section with index 3
+ # CHECK-NEXT:     Name: <?>
+-# CHECK-NEXT:     BB entries [
++# CHECK-NEXT:     BB Ranges [
+ # CHECK-NEXT:       {
+-# CHECK-NEXT:         ID: 0
+-# CHECK-NEXT:         Offset: 0x0
+-# CHECK-NEXT:         Size: 0x1
+-# CHECK-NEXT:         HasReturn: No
+-# CHECK-NEXT:         HasTailCall: Yes
+-# CHECK-NEXT:         IsEHPad: No
+-# CHECK-NEXT:         CanFallThrough: No
+-# CHECK-NEXT:         HasIndirectBranch: No
++# CHECK-NEXT:         Base Address: [[ADDR]]
++# CHECK-NEXT:         BB Entries [
++# CHECK-NEXT:           {
++# CHECK-NEXT:             ID: 0
++# CHECK-NEXT:             Offset: 0x0
++# CHECK-NEXT:             Size: 0x1
++# CHECK-NEXT:             HasReturn: No
++# CHECK-NEXT:             HasTailCall: Yes
++# CHECK-NEXT:             IsEHPad: No
++# CHECK-NEXT:             CanFallThrough: No
++# CHECK-NEXT:             HasIndirectBranch: No
++# CHECK-NEXT:           }
++# CHECK-NEXT:         ]
+ # CHECK-NEXT:       }
+ # CHECK-NEXT:       {
+-# CHECK-NEXT:         ID: 2
+-# CHECK-NEXT:         Offset: 0x4
+-# CHECK-NEXT:         Size: 0x4
+-# CHECK-NEXT:         HasReturn: Yes
+-# CHECK-NEXT:         HasTailCall: No
+-# CHECK-NEXT:         IsEHPad: Yes
+-# CHECK-NEXT:         CanFallThrough: No
+-# CHECK-NEXT:         HasIndirectBranch: Yes
++# CHECK-NEXT:         Base Address: 0x44444
++# CHECK-NEXT:         BB Entries [
++# CHECK-NEXT:           {
++# CHECK-NEXT:             ID: 2
++# CHECK-NEXT:             Offset: 0x3
++# CHECK-NEXT:             Size: 0x4
++# CHECK-NEXT:             HasReturn: Yes
++# CHECK-NEXT:             HasTailCall: No
++# CHECK-NEXT:             IsEHPad: Yes
++# CHECK-NEXT:             CanFallThrough: No
++# CHECK-NEXT:             HasIndirectBranch: Yes
++# CHECK-NEXT:           }
++# CHECK-NEXT:         ]
+ # CHECK-NEXT:       }
+ # CHECK-NEXT:     ]
+ # CHECK-NEXT:   }
+ # CHECK-NEXT:   Function {
+ # CHECK-NEXT:     At: 0x22222
+ # CHECK-NEXT:     Name: foo
+-# CHECK-NEXT:     BB entries [
++# CHECK-NEXT:     BB Ranges [
+ # CHECK-NEXT:       {
+-# CHECK-NEXT:         ID: 4
+-# CHECK-NEXT:         Offset: 0x6
+-# CHECK-NEXT:         Size: 0x7
+-# CHECK-NEXT:         HasReturn: No
+-# CHECK-NEXT:         HasTailCall: No
+-# CHECK-NEXT:         IsEHPad: No
+-# CHECK-NEXT:         CanFallThrough: Yes
+-# CHECK-NEXT:         HasIndirectBranch: No
++# CHECK-NEXT:         Base Address: 0x22222
++# CHECK-NEXT:         BB Entries [
++# CHECK-NEXT:           {
++# CHECK-NEXT:             ID: 4
++# CHECK-NEXT:             Offset: 0x6
++# CHECK-NEXT:             Size: 0x7
++# CHECK-NEXT:             HasReturn: No
++# CHECK-NEXT:             HasTailCall: No
++# CHECK-NEXT:             IsEHPad: No
++# CHECK-NEXT:             CanFallThrough: Yes
++# CHECK-NEXT:            HasIndirectBranch: No
++# CHECK-NEXT:           }
++# CHECK-NEXT:         ]
+ # CHECK-NEXT:       }
+ # CHECK-NEXT:     ]
+ # CHECK-NEXT:   }
+@@ -78,26 +93,31 @@
+ # TRUNCATED-NEXT:   Function {
+ # TRUNCATED-NEXT:     At: 0x33333
+ # TRUNCATED-NEXT:     Name: bar
+-# TRUNCATED-NEXT:     BB entries [
++# TRUNCATED-NEXT:     BB Ranges [
+ # TRUNCATED-NEXT:       {
+-# TRUNCATED-NEXT:         ID: 6
+-# TRUNCATED-NEXT:         Offset: 0x9
+-# TRUNCATED-NEXT:         Size: 0xA
+-# TRUNCATED-NEXT:         HasReturn: Yes
+-# TRUNCATED-NEXT:         HasTailCall: Yes
+-# TRUNCATED-NEXT:         IsEHPad: No
+-# TRUNCATED-NEXT:         CanFallThrough: Yes
+-# TRUNCATED-NEXT:         HasIndirectBranch: Yes
+-# TRUNCATED-NEXT:       }
+-# TRUNCATED-NEXT:       {
+-# TRUNCATED-NEXT:         ID: 7
+-# TRUNCATED-NEXT:         Offset: 0x1F
+-# TRUNCATED-NEXT:         Size: 0xD
+-# TRUNCATED-NEXT:         HasReturn: No
+-# TRUNCATED-NEXT:         HasTailCall: Yes
+-# TRUNCATED-NEXT:         IsEHPad: Yes
+-# TRUNCATED-NEXT:         CanFallThrough: Yes
+-# TRUNCATED-NEXT:         HasIndirectBranch: No
++# TRUNCATED-NEXT:         Base Address: 0x33333
++# TRUNCATED-NEXT:         BB Entries [
++# TRUNCATED-NEXT:           {
++# TRUNCATED-NEXT:             ID: 6
++# TRUNCATED-NEXT:             Offset: 0x9
++# TRUNCATED-NEXT:             Size: 0xA
++# TRUNCATED-NEXT:             HasReturn: Yes
++# TRUNCATED-NEXT:             HasTailCall: Yes
++# TRUNCATED-NEXT:             IsEHPad: No
++# TRUNCATED-NEXT:             CanFallThrough: Yes
++# TRUNCATED-NEXT:             HasIndirectBranch: Yes
++# TRUNCATED-NEXT:           }
++# TRUNCATED-NEXT:           {
++# TRUNCATED-NEXT:             ID: 7
++# TRUNCATED-NEXT:             Offset: 0x1F
++# TRUNCATED-NEXT:             Size: 0xD
++# TRUNCATED-NEXT:             HasReturn: No
++# TRUNCATED-NEXT:             HasTailCall: Yes
++# TRUNCATED-NEXT:             IsEHPad: Yes
++# TRUNCATED-NEXT:             CanFallThrough: Yes
++# TRUNCATED-NEXT:             HasIndirectBranch: No
++# TRUNCATED-NEXT:           }
++# TRUNCATED-NEXT:         ]
+ # TRUNCATED-NEXT:       }
+ # TRUNCATED-NEXT:     ]
+ # TRUNCATED-NEXT:   }
+@@ -124,23 +144,28 @@ Sections:
+     Link:   .text
+     Entries:
+       - Version: 2
+-        Address: [[ADDR=0x11111]]
+-        BBEntries:
+-          - ID:            0
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      [[METADATA=0x2]]
+-          - ID:            2
+-            AddressOffset: 0x3
+-            Size:          0x4
+-            Metadata:      0x15
++        Feature: 0x8
++        BBRanges:
++          - BaseAddress: [[ADDR=0x11111]]
++            BBEntries:
++              - ID:            0
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      [[METADATA=0x2]]
++          - BaseAddress: 0x44444
++            BBEntries:
++              - ID:            2
++                AddressOffset: 0x3
++                Size:          0x4
++                Metadata:      0x15
+       - Version: 2
+-        Address: 0x22222
+-        BBEntries:
+-          - ID:            4
+-            AddressOffset: 0x6
+-            Size:          0x7
+-            Metadata:      0x8
++        BBRanges:
++          - BaseAddress: 0x22222
++            BBEntries:
++              - ID:            4
++                AddressOffset: 0x6
++                Size:          0x7
++                Metadata:      0x8
+   - Name: dummy_section
+     Type: SHT_PROGBITS
+     Size: 16
+@@ -149,16 +174,17 @@ Sections:
+     Link: .text.bar
+     Entries:
+       - Version: 2
+-        Address: 0x33333
+-        BBEntries:
+-          - ID:            6
+-            AddressOffset: 0x9
+-            Size:          0xa
+-            Metadata:      0x1b
+-          - ID:            7
+-            AddressOffset: 0xc
+-            Size:          0xd
+-            Metadata:      0xe
++        BBRanges:
++          - BaseAddress: 0x33333
++            BBEntries:
++              - ID:            6
++                AddressOffset: 0x9
++                Size:          0xa
++                Metadata:      0x1b
++              - ID:            7
++                AddressOffset: 0xc
++                Size:          0xd
++                Metadata:      0xe
+ Symbols:
+   - Name:    foo
+     Section: .text
+@@ -168,103 +194,3 @@ Symbols:
+     Section: .text.bar
+     Type:    STT_FUNC
+     Value:   0x33333
+-
+-## Check that using the SHT_LLVM_BB_ADDR_MAP_V0 section type generates the same
+-## result as using the SHT_LLVM_BB_ADDR_MAP section type with Version=0.
+-## The Version field is required even for SHT_LLVM_BB_ADDR_MAP_V0 but it
+-## should not impact the result. This unideal behavior will be gone once
+-## SHT_LLVM_BB_ADDR_MAP_V0 is deprecated.
+-
+-# RUN: yaml2obj --docnum=2 %s -DVERSION=255 -DSECTION_TYPE=SHT_LLVM_BB_ADDR_MAP_V0 -o %t2.type0
+-# RUN: llvm-readobj %t2.type0 --bb-addr-map 2>&1 | FileCheck %s --check-prefix=V0
+-
+-# RUN: yaml2obj --docnum=2 %s -DVERSION=0 -DSECTION_TYPE=SHT_LLVM_BB_ADDR_MAP -o %t2.version0
+-# RUN: llvm-readobj %t2.version0 --bb-addr-map 2>&1 | FileCheck %s --check-prefix=V0
+-
+-# V0:      BBAddrMap [
+-# V0-NEXT:   Function {
+-# V0-NEXT:     At:   0x11111
+-# V0-NEXT:     Name: foo
+-# V0-NEXT:     BB entries [
+-# V0-NEXT:       {
+-# V0-NEXT:         ID: 0
+-# V0-NEXT:         Offset: 0x1
+-# V0-NEXT:         Size: 0x2
+-# V0-NEXT:         HasReturn:
+-# V0-NEXT:         HasTailCall:
+-# V0-NEXT:         IsEHPad:
+-# V0-NEXT:         CanFallThrough:
+-# V0-NEXT:         HasIndirectBranch:
+-# V0-NEXT:       }
+-# V0-NEXT:       {
+-# V0-NEXT:         ID: 1
+-# V0-NEXT:         Offset: 0x4
+-# V0-NEXT:         Size: 0x5
+-# V0-NEXT:         HasReturn:
+-# V0-NEXT:         HasTailCall:
+-# V0-NEXT:         IsEHPad:
+-# V0-NEXT:         CanFallThrough:
+-# V0-NEXT:         HasIndirectBranch:
+-# V0-NEXT:       }
+-# V0-NEXT:     ]
+-# V0-NEXT:   }
+-
+-## Check version 1 (without BB IDs).
+-# RUN: yaml2obj --docnum=2 %s -DVERSION=1 -DSECTION_TYPE=SHT_LLVM_BB_ADDR_MAP -o %t3
+-# RUN: llvm-readobj %t3 --bb-addr-map 2>&1 | FileCheck %s --check-prefix=V1
+-
+-# V1:      BBAddrMap [
+-# V1-NEXT:   Function {
+-# V1-NEXT:     At:   0x11111
+-# V1-NEXT:     Name: foo
+-# V1-NEXT:     BB entries [
+-# V1-NEXT:       {
+-# V1-NEXT:         ID: 0
+-# V1-NEXT:         Offset: 0x1
+-# V1-NEXT:         Size: 0x2
+-# V1-NEXT:         HasReturn:
+-# V1-NEXT:         HasTailCall:
+-# V1-NEXT:         IsEHPad:
+-# V1-NEXT:         CanFallThrough:
+-# V1-NEXT:         HasIndirectBranch:
+-# V1-NEXT:       }
+-# V1-NEXT:       {
+-# V1-NEXT:         ID: 1
+-# V1-NEXT:         Offset: 0x7
+-# V1-NEXT:         Size: 0x5
+-# V1-NEXT:         HasReturn:
+-# V1-NEXT:         HasTailCall:
+-# V1-NEXT:         IsEHPad:
+-# V1-NEXT:         CanFallThrough:
+-# V1-NEXT:         HasIndirectBranch:
+-# V1-NEXT:       }
+-# V1-NEXT:     ]
+-# V1-NEXT:   }
+-
+---- !ELF
+-FileHeader:
+-  Class: ELFCLASS64
+-  Data:  ELFDATA2LSB
+-  Type:  ET_EXEC
+-Sections:
+-  - Name:  .text.foo
+-    Type:  SHT_PROGBITS
+-    Flags: [SHF_ALLOC]
+-  - Name:  .llvm_bb_addr_map
+-    Type:  [[SECTION_TYPE]]
+-    Link:  .text.foo
+-    Entries:
+-      - Version: [[VERSION]]
+-        Address: 0x11111
+-        BBEntries:
+-          - AddressOffset: 0x1
+-            Size:          0x2
+-            Metadata:      0x3
+-          - AddressOffset: 0x4
+-            Size:          0x5
+-            Metadata:      0x6
+-Symbols:
+-  - Name:    foo
+-    Section: .text.foo
+-    Type:    STT_FUNC
+-    Value:   0x11111
+diff --git a/llvm/test/tools/obj2yaml/ELF/bb-addr-map.yaml b/llvm/test/tools/obj2yaml/ELF/bb-addr-map.yaml
+index 629c29e202ae..8dbf97ef2bc1 100644
+--- a/llvm/test/tools/obj2yaml/ELF/bb-addr-map.yaml
++++ b/llvm/test/tools/obj2yaml/ELF/bb-addr-map.yaml
+@@ -14,30 +14,31 @@
+ # VALID-NEXT:   - Name: .llvm_bb_addr_map
+ # VALID-NEXT:     Type: SHT_LLVM_BB_ADDR_MAP
+ # VALID-NEXT:     Entries:
+-## The 'Address' field is omitted when it's zero.
+ # VALID-NEXT:       - Version: 2
+-# VALID-NEXT:         Feature: 0xFF
+-# VALID-NEXT:         BBEntries:
+-# VALID-NEXT:           - ID:            0
+-# VALID-NEXT:             AddressOffset: 0x1
+-# VALID-NEXT:             Size:          0x2
+-# VALID-NEXT:             Metadata:      0x3
+-# VALID-NEXT:           - ID:            2
+-# VALID-NEXT:             AddressOffset: 0x4
+-# VALID-NEXT:             Size:          0x5
+-# VALID-NEXT:             Metadata:      0x6
+-# VALID-NEXT:           - ID:            4
+-# VALID-NEXT:             AddressOffset: 0xFFFFFFFFFFFFFFF7
+-# VALID-NEXT:             Size:          0xFFFFFFFFFFFFFFF8
+-# VALID-NEXT:             Metadata:      0xFFFFFFFFFFFFFFF9
++# VALID-NEXT:         BBRanges:
++## The 'BaseAddress' field is omitted when it's zero.
++# VALID-NEXT:           - BBEntries:
++# VALID-NEXT:             - ID:            0
++# VALID-NEXT:               AddressOffset: 0x1
++# VALID-NEXT:               Size:          0x2
++# VALID-NEXT:               Metadata:      0x3
++# VALID-NEXT:             - ID:            2
++# VALID-NEXT:               AddressOffset: 0x4
++# VALID-NEXT:               Size:          0x5
++# VALID-NEXT:               Metadata:      0x6
++# VALID-NEXT:             - ID:            4
++# VALID-NEXT:               AddressOffset: 0xFFFFFFFFFFFFFFF7
++# VALID-NEXT:               Size:          0xFFFFFFFFFFFFFFF8
++# VALID-NEXT:               Metadata:      0xFFFFFFFFFFFFFFF9
+ # VALID-NEXT:       - Version: 2
+-# VALID-NEXT:         Feature: 0xEE
+-# VALID-NEXT:         Address: 0xFFFFFFFFFFFFFF20
+-# VALID-NEXT:         BBEntries:
+-# VALID-NEXT:           - ID:            6
+-# VALID-NEXT:             AddressOffset: 0xA
+-# VALID-NEXT:             Size:          0xB
+-# VALID-NEXT:             Metadata:      0xC
++# VALID-NEXT:         Feature: 0x8
++# VALID-NEXT:         BBRanges:
++# VALID-NEXT:           - BaseAddress: 0xFFFFFFFFFFFFFF20
++# VALID-NEXT:             BBEntries:
++# VALID-NEXT:               - ID:            6
++# VALID-NEXT:                 AddressOffset: 0xA
++# VALID-NEXT:                 Size:          0xB
++# VALID-NEXT:                 Metadata:      0xC
+ 
+ --- !ELF
+ FileHeader:
+@@ -50,30 +51,33 @@ Sections:
+     ShSize: [[SIZE=<none>]]
+     Entries:
+       - Version: 2
+-        Feature: 0xFF
+-        Address: 0x0
+-        BBEntries:
+-          - ID:            0
+-            AddressOffset: 0x1
+-            Size:          0x2
+-            Metadata:      0x3
+-          - ID:            2
+-            AddressOffset: 0x4
+-            Size:          0x5
+-            Metadata:      0x6
+-          - ID:            4
+-            AddressOffset: 0xFFFFFFFFFFFFFFF7
+-            Size:          0xFFFFFFFFFFFFFFF8
+-            Metadata:      0xFFFFFFFFFFFFFFF9
++        Feature: 0x0
++        BBRanges:
++          - BaseAddress: 0x0
++            BBEntries:
++              - ID:            0
++                AddressOffset: 0x1
++                Size:          0x2
++                Metadata:      0x3
++              - ID:            2
++                AddressOffset: 0x4
++                Size:          0x5
++                Metadata:      0x6
++              - ID:            4
++                AddressOffset: 0xFFFFFFFFFFFFFFF7
++                Size:          0xFFFFFFFFFFFFFFF8
++                Metadata:      0xFFFFFFFFFFFFFFF9
+       - Version:   2
+-        Feature:   0xEE
+-        Address:   0xFFFFFFFFFFFFFF20
+-        NumBlocks: [[NUMBLOCKS=<none>]]
+-        BBEntries:
+-          - ID:            6
+-            AddressOffset: 0xA
+-            Size:          0xB
+-            Metadata:      0xC
++        Feature:   0x8
++        NumBBRanges: [[NUMBBRANGES=<none>]]
++        BBRanges:
++          - BaseAddress:   0xFFFFFFFFFFFFFF20
++            NumBlocks: [[NUMBLOCKS=<none>]]
++            BBEntries:
++             - ID:            6
++               AddressOffset: 0xA
++               Size:          0xB
++               Metadata:      0xC
+ 
+ ## Check obj2yaml can dump empty .llvm_bb_addr_map sections.
+ 
+@@ -114,19 +118,21 @@ Sections:
+ # MULTI-NEXT:   - Name: .llvm_bb_addr_map
+ # MULTI-NEXT:     Type: SHT_LLVM_BB_ADDR_MAP
+ # MULTI-NEXT:     Entries:
+-## Fields 'Address' and 'Feature' are omitted when they are zero.
++## Fields 'BaseAddress' and 'Feature' are omitted when they are zero.
+ # MULTI-NEXT:       - Version: 0
+-# MULTI-NEXT:         BBEntries:
+-# MULTI-NEXT:           - ID:            0
+-# MULTI-NEXT:             AddressOffset: 0x1
+-# MULTI-NEXT:             Size:          0x2
+-# MULTI-NEXT:             Metadata:      0x3
++# MULTI-NEXT:         BBRanges:
++# MULTI-NEXT:           - BBEntries:
++# MULTI-NEXT:              - ID:            0
++# MULTI-NEXT:                AddressOffset: 0x1
++# MULTI-NEXT:                Size:          0x2
++# MULTI-NEXT:                Metadata:      0x3
+ # MULTI-NEXT:   - Name: '.llvm_bb_addr_map (1)'
+ # MULTI-NEXT:     Type: SHT_LLVM_BB_ADDR_MAP
+ # MULTI-NEXT:     Entries:
+ # MULTI-NEXT:       - Version:   0
+-# MULTI-NEXT:         Address:   0x20
+-# MULTI-NEXT:         BBEntries: []
++# MULTI-NEXT:         BBRanges:
++# MULTI-NEXT:           - BaseAddress:   0x20
++# MULTI-NEXT:             BBEntries: []
+ 
+ --- !ELF
+ FileHeader:
+@@ -141,26 +147,31 @@ Sections:
+ ## they are zero.
+       - Version: 0
+         Feature: 0x0
+-        Address: 0x0
+-        BBEntries:
+-          - AddressOffset: 0x1
+-            Size:          0x2
+-            Metadata:      0x3
++        BBRanges:
++          - BaseAddress: 0x0
++            BBEntries:
++              - AddressOffset: 0x1
++                Size:          0x2
++                Metadata:      0x3
+   - Name: '.llvm_bb_addr_map (1)'
+     Type:  SHT_LLVM_BB_ADDR_MAP
+     Entries:
+       - Version: 0
+-        Address: 0x20
++        BBRanges:
++          - BaseAddress: 0x20
+ 
+ ## Check that obj2yaml uses the "Content" tag to describe an .llvm_bb_addr_map section
+ ## when it can't extract the entries, for example, when the section is truncated, or
+-## when an invalid 'NumBlocks' field is specified.
++## when an invalid 'NumBlocks' or 'NumBBRanges` field is specified.
+ 
+ # RUN: yaml2obj --docnum=1 -DSIZE=0x8 %s -o %t4
+ # RUN: obj2yaml %t4 | FileCheck %s --check-prefixes=TRUNCATED,INVALID
+ 
+ # RUN: yaml2obj --docnum=1 -DNUMBLOCKS=2 %s -o %t5
+-# RUN: obj2yaml %t5 | FileCheck %s --check-prefixes=BADNUMBLOCKS,INVALID
++# RUN: obj2yaml %t5 | FileCheck %s --check-prefixes=BADNUM,INVALID
++
++# RUN: yaml2obj --docnum=1 -DNUMBBRANGES=2 %s -o %t6
++# RUN: obj2yaml %t6 | FileCheck %s --check-prefixes=BADNUM,INVALID
+ 
+ # INVALID:           --- !ELF
+ # INVALID-NEXT:      FileHeader:
+@@ -170,86 +181,5 @@ Sections:
+ # INVALID-NEXT:      Sections:
+ # INVALID-NEXT:        - Name:    .llvm_bb_addr_map
+ # INVALID-NEXT:          Type:    SHT_LLVM_BB_ADDR_MAP
+-# BADNUMBLOCKS-NEXT:     Content: {{([[:xdigit:]]+)}}{{$}}
+-# TRUNCATED-NEXT:        Content: {{([[:xdigit:]]{16})}}{{$}}
+-
+-## Check obj2yaml for SHT_LLVM_BB_ADDR_MAP_V0.
+-# RUN: yaml2obj --docnum=4 %s -o %t6
+-# RUN: obj2yaml %t6 | FileCheck %s --check-prefix=V0
+-
+-# V0:      --- !ELF
+-# V0-NEXT: FileHeader:
+-# V0-NEXT:   Class: ELFCLASS64
+-# V0-NEXT:   Data:  ELFDATA2LSB
+-# V0-NEXT:   Type:  ET_EXEC
+-# V0-NEXT: Sections:
+-# V0-NEXT:   - Name: .llvm_bb_addr_map
+-# V0-NEXT:     Type: SHT_LLVM_BB_ADDR_MAP_V0
+-# V0-NEXT:     Entries:
+-# V0-NEXT:       - Version: 0
+-# V0-NEXT:         Address: 0x1111
+-# V0-NEXT:         BBEntries:
+-# V0-NEXT:           - ID:            0
+-# V0-NEXT:             AddressOffset: 0x1
+-# V0-NEXT:             Size:          0x2
+-# V0-NEXT:             Metadata:      0x3
+-
+---- !ELF
+-FileHeader:
+-  Class: ELFCLASS64
+-  Data:  ELFDATA2LSB
+-  Type:  ET_EXEC
+-Sections:
+-  - Name: .llvm_bb_addr_map
+-    Type: SHT_LLVM_BB_ADDR_MAP_V0
+-    Entries:
+-      - Version: 0
+-        Address: 0x1111
+-        BBEntries:
+-          - AddressOffset: 0x1
+-            Size:          0x2
+-            Metadata:      0x3
+-
+-## Check obj2yaml for version 1.
+-# RUN: yaml2obj --docnum=5 %s -o %t7
+-# RUN: obj2yaml %t7 | FileCheck %s --check-prefix=V1
+-
+-# V1:      --- !ELF
+-# V1-NEXT: FileHeader:
+-# V1-NEXT:   Class: ELFCLASS64
+-# V1-NEXT:   Data:  ELFDATA2LSB
+-# V1-NEXT:   Type:  ET_EXEC
+-# V1-NEXT: Sections:
+-# V1-NEXT:   - Name: .llvm_bb_addr_map
+-# V1-NEXT:     Type: SHT_LLVM_BB_ADDR_MAP
+-# V1-NEXT:     Entries:
+-# V1-NEXT:       - Version: 1
+-# V1-NEXT:         Address: 0x1111
+-# V1-NEXT:         BBEntries:
+-# V1-NEXT:           - ID:            0
+-# V1-NEXT:             AddressOffset: 0x1
+-# V1-NEXT:             Size:          0x2
+-# V1-NEXT:             Metadata:      0x3
+-# V1-NEXT:           - ID:            1
+-# V1-NEXT:             AddressOffset: 0x4
+-# V1-NEXT:             Size:          0x5
+-# V1-NEXT:             Metadata:      0x6
+-
+---- !ELF
+-FileHeader:
+-  Class: ELFCLASS64
+-  Data:  ELFDATA2LSB
+-  Type:  ET_EXEC
+-Sections:
+-  - Name: .llvm_bb_addr_map
+-    Type: SHT_LLVM_BB_ADDR_MAP
+-    Entries:
+-      - Version: 1
+-        Address: 0x1111
+-        BBEntries:
+-          - AddressOffset: 0x1
+-            Size:          0x2
+-            Metadata:      0x3
+-          - AddressOffset: 0x4
+-            Size:          0x5
+-            Metadata:      0x6
++# BADNUM-NEXT:           Content: {{([[:xdigit:]]+)}}{{$}}
++# TRUNCATED-NEXT:        Content: '{{([[:xdigit:]]{16})}}'{{$}}
+diff --git a/llvm/test/tools/yaml2obj/ELF/bb-addr-map.yaml b/llvm/test/tools/yaml2obj/ELF/bb-addr-map.yaml
+index 2086dc53208b..709938babffb 100644
+--- a/llvm/test/tools/yaml2obj/ELF/bb-addr-map.yaml
++++ b/llvm/test/tools/yaml2obj/ELF/bb-addr-map.yaml
+@@ -53,6 +53,21 @@
+ # CHECK-NEXT:     0000: 02002000 00000000 0000020D 010203
+ # CHECK-NEXT:   )
+ 
++# Case 7: Specify empty BBRanges.
++# CHECK:        Name: .llvm_bb_addr_map (1)
++# CHECK:        SectionData (
++# CHECK-NEXT:     0000: 020000
++# CHECK-NEXT:   )
++
++# Case 8: Specify empty BBRanges with multi-bb-range.
++# CHECK:        Name: .llvm_bb_addr_map (1)
++# CHECK:        SectionData (
++# CHECK-NEXT:     0000: 020800
++# CHECK-NEXT:   )
++
++
++
++
+ --- !ELF
+ FileHeader:
+   Class: ELFCLASS64
+@@ -86,12 +101,13 @@ Sections:
+     Type: SHT_LLVM_BB_ADDR_MAP
+     Entries:
+       - Version: 2
+-        Address: 0x0000000000000020
+-        BBEntries:
+-          - ID:            11
+-            AddressOffset: 0x00000001
+-            Size:          0x00000002
+-            Metadata:      0x00000003
++        BBRanges:
++          - BaseAddress: 0x0000000000000020
++            BBEntries:
++              - ID:            11
++                AddressOffset: 0x00000001
++                Size:          0x00000002
++                Metadata:      0x00000003
+ 
+ ## 5) When specifying the description with Entries, the 'Address' field will be
+ ##    zero when omitted.
+@@ -99,11 +115,12 @@ Sections:
+     Type: SHT_LLVM_BB_ADDR_MAP
+     Entries:
+       - Version: 2
+-        BBEntries:
+-          - ID:            12
+-            AddressOffset: 0x00000001
+-            Size:          0x00000002
+-            Metadata:      0x00000003
++        BBRanges:
++          - BBEntries:
++            - ID:            12
++              AddressOffset: 0x00000001
++              Size:          0x00000002
++              Metadata:      0x00000003
+ 
+ ## 6) We can override the NumBlocks field with a value different from the
+ ##    actual number of BB Entries.
+@@ -111,13 +128,31 @@ Sections:
+     Type: SHT_LLVM_BB_ADDR_MAP
+     Entries:
+       - Version:   2
+-        Address:   0x0000000000000020
+-        NumBlocks: 2
+-        BBEntries:
+-          - ID:            13
+-            AddressOffset: 0x00000001
+-            Size:          0x00000002
+-            Metadata:      0x00000003
++        BBRanges:
++          - BaseAddress:   0x0000000000000020
++            NumBlocks: 2
++            BBEntries:
++             - ID:            13
++               AddressOffset: 0x00000001
++               Size:          0x00000002
++               Metadata:      0x00000003
++
++## 7) We can produce a SHT_LLVM_BB_ADDR_MAP section from a description
++##    with one entry with empty BBRanges.
++  - Name: '.llvm_bb_addr_map (7)'
++    Type: SHT_LLVM_BB_ADDR_MAP
++    Entries:
++      - Version: 2
++        BBRanges: []
++
++## 8) We can produce a SHT_LLVM_BB_ADDR_MAP section from a multi-bb-range
++##    description with one entry with empty BBRanges.
++  - Name: '.llvm_bb_addr_map (8)'
++    Type: SHT_LLVM_BB_ADDR_MAP
++    Entries:
++      - Version: 2
++        Feature: 0x8
++        BBRanges: []
+ 
+ ## Check we can't use Entries at the same time as either Content or Size.
+ # RUN: not yaml2obj --docnum=2 -DCONTENT="00" %s 2>&1 | FileCheck %s --check-prefix=INVALID
+diff --git a/llvm/tools/llvm-objdump/llvm-objdump.cpp b/llvm/tools/llvm-objdump/llvm-objdump.cpp
+index 7f57713e6f94..b4467ec163c3 100644
+--- a/llvm/tools/llvm-objdump/llvm-objdump.cpp
++++ b/llvm/tools/llvm-objdump/llvm-objdump.cpp
+@@ -172,6 +172,110 @@ public:
+                        "Mach-O object file displaying tool") {}
+ };
+ 
++struct BBAddrMapLabel {
++  std::string BlockLabel;
++  std::string PGOAnalysis;
++};
++
++// This class represents the BBAddrMap and PGOMap associated with a single
++// function.
++class BBAddrMapFunctionEntry {
++public:
++  BBAddrMapFunctionEntry(BBAddrMap AddrMap, PGOAnalysisMap PGOMap)
++      : AddrMap(std::move(AddrMap)), PGOMap(std::move(PGOMap)) {}
++
++  const BBAddrMap &getAddrMap() const { return AddrMap; }
++
++  // Returns the PGO string associated with the entry of index `PGOBBEntryIndex`
++  // in `PGOMap`.
++  std::string constructPGOLabelString(size_t PGOBBEntryIndex) const {
++    if (!PGOMap.FeatEnable.hasPGOAnalysis())
++      return "";
++    std::string PGOString;
++    raw_string_ostream PGOSS(PGOString);
++
++    PGOSS << " (";
++    if (PGOMap.FeatEnable.FuncEntryCount && PGOBBEntryIndex == 0) {
++      PGOSS << "Entry count: " << Twine(PGOMap.FuncEntryCount);
++      if (PGOMap.FeatEnable.hasPGOAnalysisBBData()) {
++        PGOSS << ", ";
++      }
++    }
++
++    if (PGOMap.FeatEnable.hasPGOAnalysisBBData()) {
++
++      assert(PGOBBEntryIndex < PGOMap.BBEntries.size() &&
++             "Expected PGOAnalysisMap and BBAddrMap to have the same entries");
++      const PGOAnalysisMap::PGOBBEntry &PGOBBEntry =
++          PGOMap.BBEntries[PGOBBEntryIndex];
++
++      if (PGOMap.FeatEnable.BBFreq) {
++        PGOSS << "Frequency: " << Twine(PGOBBEntry.BlockFreq.getFrequency());
++        if (PGOMap.FeatEnable.BrProb && PGOBBEntry.Successors.size() > 0) {
++          PGOSS << ", ";
++        }
++      }
++      if (PGOMap.FeatEnable.BrProb && PGOBBEntry.Successors.size() > 0) {
++        PGOSS << "Successors: ";
++        interleaveComma(
++            PGOBBEntry.Successors, PGOSS,
++            [&PGOSS](const PGOAnalysisMap::PGOBBEntry::SuccessorEntry &SE) {
++              PGOSS << "BB" << SE.ID << ":";
++              PGOSS.write_hex(SE.Prob.getNumerator());
++            });
++      }
++    }
++    PGOSS << ")";
++
++    return PGOString;
++  }
++
++private:
++  const BBAddrMap AddrMap;
++  const PGOAnalysisMap PGOMap;
++};
++
++// This class represents the BBAddrMap and PGOMap of potentially multiple
++// functions in a section.
++class BBAddrMapInfo {
++public:
++  void clear() {
++    FunctionAddrToMap.clear();
++    RangeBaseAddrToFunctionAddr.clear();
++  }
++
++  bool empty() const { return FunctionAddrToMap.empty(); }
++
++  void AddFunctionEntry(BBAddrMap AddrMap, PGOAnalysisMap PGOMap) {
++    uint64_t FunctionAddr = AddrMap.getFunctionAddress();
++    for (size_t I = 1; I < AddrMap.BBRanges.size(); ++I)
++      RangeBaseAddrToFunctionAddr.emplace(AddrMap.BBRanges[I].BaseAddress,
++                                          FunctionAddr);
++    [[maybe_unused]] auto R = FunctionAddrToMap.try_emplace(
++        FunctionAddr, std::move(AddrMap), std::move(PGOMap));
++    assert(R.second && "duplicate function address");
++  }
++
++  // Returns the BBAddrMap entry for the function associated with `BaseAddress`.
++  // `BaseAddress` could be the function address or the address of a range
++  // associated with that function. Returns `nullptr` if `BaseAddress` is not
++  // mapped to any entry.
++  const BBAddrMapFunctionEntry *getEntryForAddress(uint64_t BaseAddress) const {
++    uint64_t FunctionAddr = BaseAddress;
++    auto S = RangeBaseAddrToFunctionAddr.find(BaseAddress);
++    if (S != RangeBaseAddrToFunctionAddr.end())
++      FunctionAddr = S->second;
++    auto R = FunctionAddrToMap.find(FunctionAddr);
++    if (R == FunctionAddrToMap.end())
++      return nullptr;
++    return &R->second;
++  }
++
++private:
++  std::unordered_map<uint64_t, BBAddrMapFunctionEntry> FunctionAddrToMap;
++  std::unordered_map<uint64_t, uint64_t> RangeBaseAddrToFunctionAddr;
++};
++
+ } // namespace
+ 
+ #define DEBUG_TYPE "objdump"
+@@ -1266,80 +1370,38 @@ static SymbolInfoTy createDummySymbolInfo(const ObjectFile &Obj,
+     return SymbolInfoTy(Addr, Name, Type);
+ }
+ 
+-struct BBAddrMapLabel {
+-  std::string BlockLabel;
+-  std::string PGOAnalysis;
+-};
+-
+-static std::string constructPGOLabelString(const PGOAnalysisMap &PGOMap,
+-                                           size_t BBEntryIndex) {
+-  std::string PGOString;
+-  raw_string_ostream PGOSS(PGOString);
+-
+-  PGOSS << " (";
+-  if (PGOMap.FeatEnable.FuncEntryCount && BBEntryIndex == 0) {
+-    PGOSS << "Entry count: " << Twine(PGOMap.FuncEntryCount);
+-    if (PGOMap.FeatEnable.BBFreq || PGOMap.FeatEnable.BrProb) {
+-      PGOSS << ", ";
+-    }
+-  }
+-
+-  if (PGOMap.FeatEnable.BBFreq || PGOMap.FeatEnable.BrProb) {
+-    assert(BBEntryIndex < PGOMap.BBEntries.size() &&
+-           "Expected PGOAnalysisMap and BBAddrMap to have the same entires");
+-    const PGOAnalysisMap::PGOBBEntry &PGOBBEntry =
+-        PGOMap.BBEntries[BBEntryIndex];
+-
+-    if (PGOMap.FeatEnable.BBFreq) {
+-      PGOSS << "Frequency: " << Twine(PGOBBEntry.BlockFreq.getFrequency());
+-      if (PGOMap.FeatEnable.BrProb && PGOBBEntry.Successors.size() > 0) {
+-        PGOSS << ", ";
+-      }
+-    }
+-    if (PGOMap.FeatEnable.BrProb && PGOBBEntry.Successors.size() > 0) {
+-      PGOSS << "Successors: ";
+-      interleaveComma(
+-          PGOBBEntry.Successors, PGOSS,
+-          [&PGOSS](const PGOAnalysisMap::PGOBBEntry::SuccessorEntry &SE) {
+-            PGOSS << "BB" << SE.ID << ":";
+-            PGOSS.write_hex(SE.Prob.getNumerator());
+-          });
+-    }
+-  }
+-  PGOSS << ")";
+-
+-  return PGOString;
+-}
+-
+ static void collectBBAddrMapLabels(
+-    const std::unordered_map<uint64_t, BBAddrMap> &AddrToBBAddrMap,
+-    const std::unordered_map<uint64_t, PGOAnalysisMap> &AddrToPGOAnalysisMap,
+-    uint64_t SectionAddr, uint64_t Start, uint64_t End,
+-    std::unordered_map<uint64_t, std::vector<BBAddrMapLabel>> &Labels,
+-    const StringRef FileName) {
+-  if (AddrToBBAddrMap.empty())
++    const BBAddrMapInfo &FullAddrMap, uint64_t SectionAddr, uint64_t Start,
++    uint64_t End,
++    std::unordered_map<uint64_t, std::vector<BBAddrMapLabel>> &Labels) {
++  if (FullAddrMap.empty())
+     return;
+   Labels.clear();
+   uint64_t StartAddress = SectionAddr + Start;
+   uint64_t EndAddress = SectionAddr + End;
+-  auto Iter = AddrToBBAddrMap.find(StartAddress);
+-  if (Iter == AddrToBBAddrMap.end())
++  const BBAddrMapFunctionEntry *FunctionMap =
++      FullAddrMap.getEntryForAddress(StartAddress);
++  if (!FunctionMap)
+     return;
+-  auto PGOIter = AddrToPGOAnalysisMap.find(StartAddress);
+-
+-  for (size_t I = 0; I < Iter->second.getBBEntries().size(); ++I) {
+-    const BBAddrMap::BBEntry &BBEntry = Iter->second.getBBEntries()[I];
+-    uint64_t BBAddress = BBEntry.Offset + Iter->second.getFunctionAddress();
++  std::optional<size_t> BBRangeIndex =
++      FunctionMap->getAddrMap().getBBRangeIndexForBaseAddress(StartAddress);
++  if (!BBRangeIndex)
++    return;
++  size_t NumBBEntriesBeforeRange = 0;
++  for (size_t I = 0; I < *BBRangeIndex; ++I)
++    NumBBEntriesBeforeRange +=
++        FunctionMap->getAddrMap().BBRanges[I].BBEntries.size();
++  const auto &BBRange = FunctionMap->getAddrMap().BBRanges[*BBRangeIndex];
++  for (size_t I = 0; I < BBRange.BBEntries.size(); ++I) {
++    const BBAddrMap::BBEntry &BBEntry = BBRange.BBEntries[I];
++    uint64_t BBAddress = BBEntry.Offset + BBRange.BaseAddress;
+     if (BBAddress >= EndAddress)
+       continue;
+ 
+     std::string LabelString = ("BB" + Twine(BBEntry.ID)).str();
+-    std::string PGOString;
+-
+-    if (PGOIter != AddrToPGOAnalysisMap.end())
+-      PGOString = constructPGOLabelString(PGOIter->second, I);
+-
+-    Labels[BBAddress].push_back({LabelString, PGOString});
++    Labels[BBAddress].push_back(
++        {LabelString,
++         FunctionMap->constructPGOLabelString(NumBBEntriesBeforeRange + I)});
+   }
+ }
+ 
+@@ -1696,11 +1758,10 @@ disassembleObject(ObjectFile &Obj, const ObjectFile &DbgObj,
+ 
+   LLVM_DEBUG(LVP.dump());
+ 
+-  std::unordered_map<uint64_t, BBAddrMap> AddrToBBAddrMap;
+-  std::unordered_map<uint64_t, PGOAnalysisMap> AddrToPGOAnalysisMap;
++  BBAddrMapInfo FullAddrMap;
+   auto ReadBBAddrMap = [&](std::optional<unsigned> SectionIndex =
+                                std::nullopt) {
+-    AddrToBBAddrMap.clear();
++    FullAddrMap.clear();
+     if (const auto *Elf = dyn_cast<ELFObjectFileBase>(&Obj)) {
+       std::vector<PGOAnalysisMap> PGOAnalyses;
+       auto BBAddrMapsOrErr = Elf->readBBAddrMap(SectionIndex, &PGOAnalyses);
+@@ -1710,10 +1771,8 @@ disassembleObject(ObjectFile &Obj, const ObjectFile &DbgObj,
+       }
+       for (auto &&[FunctionBBAddrMap, FunctionPGOAnalysis] :
+            zip_equal(*std::move(BBAddrMapsOrErr), std::move(PGOAnalyses))) {
+-        uint64_t Addr = FunctionBBAddrMap.Addr;
+-        AddrToBBAddrMap.emplace(Addr, std::move(FunctionBBAddrMap));
+-        if (FunctionPGOAnalysis.FeatEnable.anyEnabled())
+-          AddrToPGOAnalysisMap.emplace(Addr, std::move(FunctionPGOAnalysis));
++        FullAddrMap.AddFunctionEntry(std::move(FunctionBBAddrMap),
++                                     std::move(FunctionPGOAnalysis));
+       }
+     }
+   };
+@@ -2049,9 +2108,8 @@ disassembleObject(ObjectFile &Obj, const ObjectFile &DbgObj,
+                                   DT->DisAsm.get(), DT->InstPrinter.get(),
+                                   PrimaryTarget.SubtargetInfo.get(),
+                                   SectionAddr, Index, End, AllLabels);
+-        collectBBAddrMapLabels(AddrToBBAddrMap, AddrToPGOAnalysisMap,
+-                               SectionAddr, Index, End, BBAddrMapLabels,
+-                               FileName);
++        collectBBAddrMapLabels(FullAddrMap, SectionAddr, Index, End,
++                               BBAddrMapLabels);
+       }
+ 
+       if (DT->InstrAnalysis)
+diff --git a/llvm/tools/llvm-readobj/ELFDumper.cpp b/llvm/tools/llvm-readobj/ELFDumper.cpp
+index 4bf4640f1a4c..ce33b15b099a 100644
+--- a/llvm/tools/llvm-readobj/ELFDumper.cpp
++++ b/llvm/tools/llvm-readobj/ELFDumper.cpp
+@@ -7545,8 +7545,7 @@ template <class ELFT> void LLVMELFDumper<ELFT>::printBBAddrMaps() {
+   bool IsRelocatable = this->Obj.getHeader().e_type == ELF::ET_REL;
+   using Elf_Shdr = typename ELFT::Shdr;
+   auto IsMatch = [](const Elf_Shdr &Sec) -> bool {
+-    return Sec.sh_type == ELF::SHT_LLVM_BB_ADDR_MAP ||
+-           Sec.sh_type == ELF::SHT_LLVM_BB_ADDR_MAP_V0;
++    return Sec.sh_type == ELF::SHT_LLVM_BB_ADDR_MAP;
+   };
+   Expected<MapVector<const Elf_Shdr *, const Elf_Shdr *>> SecRelocMapOrErr =
+       this->Obj.getSectionAndRelocations(IsMatch);
+@@ -7577,40 +7576,46 @@ template <class ELFT> void LLVMELFDumper<ELFT>::printBBAddrMaps() {
+     }
+     for (const auto &[AM, PAM] : zip_equal(*BBAddrMapOrErr, PGOAnalyses)) {
+       DictScope D(W, "Function");
+-      W.printHex("At", AM.Addr);
++      W.printHex("At", AM.getFunctionAddress());
+       SmallVector<uint32_t> FuncSymIndex =
+-          this->getSymbolIndexesForFunctionAddress(AM.Addr, FunctionSec);
++          this->getSymbolIndexesForFunctionAddress(AM.getFunctionAddress(),
++                                                   FunctionSec);
+       std::string FuncName = "<?>";
+       if (FuncSymIndex.empty())
+         this->reportUniqueWarning(
+             "could not identify function symbol for address (0x" +
+-            Twine::utohexstr(AM.Addr) + ") in " + this->describe(*Sec));
++            Twine::utohexstr(AM.getFunctionAddress()) + ") in " +
++            this->describe(*Sec));
+       else
+         FuncName = this->getStaticSymbolName(FuncSymIndex.front());
+       W.printString("Name", FuncName);
+-
+       {
+-        ListScope L(W, "BB entries");
+-        for (const BBAddrMap::BBEntry &BBE : AM.BBEntries) {
+-          DictScope L(W);
+-          W.printNumber("ID", BBE.ID);
+-          W.printHex("Offset", BBE.Offset);
+-          W.printHex("Size", BBE.Size);
+-          W.printBoolean("HasReturn", BBE.hasReturn());
+-          W.printBoolean("HasTailCall", BBE.hasTailCall());
+-          W.printBoolean("IsEHPad", BBE.isEHPad());
+-          W.printBoolean("CanFallThrough", BBE.canFallThrough());
+-          W.printBoolean("HasIndirectBranch", BBE.hasIndirectBranch());
++        ListScope BBRL(W, "BB Ranges");
++        for (const BBAddrMap::BBRangeEntry &BBR : AM.BBRanges) {
++          DictScope BBRD(W);
++          W.printHex("Base Address", BBR.BaseAddress);
++          ListScope BBEL(W, "BB Entries");
++          for (const BBAddrMap::BBEntry &BBE : BBR.BBEntries) {
++            DictScope BBED(W);
++            W.printNumber("ID", BBE.ID);
++            W.printHex("Offset", BBE.Offset);
++            W.printHex("Size", BBE.Size);
++            W.printBoolean("HasReturn", BBE.hasReturn());
++            W.printBoolean("HasTailCall", BBE.hasTailCall());
++            W.printBoolean("IsEHPad", BBE.isEHPad());
++            W.printBoolean("CanFallThrough", BBE.canFallThrough());
++            W.printBoolean("HasIndirectBranch", BBE.hasIndirectBranch());
++          }
+         }
+       }
+ 
+-      if (PAM.FeatEnable.anyEnabled()) {
++      if (PAM.FeatEnable.hasPGOAnalysis()) {
+         DictScope PD(W, "PGO analyses");
+ 
+         if (PAM.FeatEnable.FuncEntryCount)
+           W.printNumber("FuncEntryCount", PAM.FuncEntryCount);
+ 
+-        if (PAM.FeatEnable.BBFreq || PAM.FeatEnable.BrProb) {
++        if (PAM.FeatEnable.hasPGOAnalysisBBData()) {
+           ListScope L(W, "PGO BB entries");
+           for (const PGOAnalysisMap::PGOBBEntry &PBBE : PAM.BBEntries) {
+             DictScope L(W);
+diff --git a/llvm/tools/obj2yaml/elf2yaml.cpp b/llvm/tools/obj2yaml/elf2yaml.cpp
+index 86bd138c2206..38a69f77ff83 100644
+--- a/llvm/tools/obj2yaml/elf2yaml.cpp
++++ b/llvm/tools/obj2yaml/elf2yaml.cpp
+@@ -626,7 +626,6 @@ ELFDumper<ELFT>::dumpSections() {
+     case ELF::SHT_LLVM_CALL_GRAPH_PROFILE:
+       return
+           [this](const Elf_Shdr *S) { return dumpCallGraphProfileSection(S); };
+-    case ELF::SHT_LLVM_BB_ADDR_MAP_V0:
+     case ELF::SHT_LLVM_BB_ADDR_MAP:
+       return [this](const Elf_Shdr *S) { return dumpBBAddrMapSection(S); };
+     case ELF::SHT_STRTAB:
+@@ -893,6 +892,7 @@ ELFDumper<ELFT>::dumpBBAddrMapSection(const Elf_Shdr *Shdr) {
+   DataExtractor::Cursor Cur(0);
+   uint8_t Version = 0;
+   uint8_t Feature = 0;
++  uint64_t Address = 0;
+   while (Cur && Cur.tell() < Content.size()) {
+     if (Shdr->sh_type == ELF::SHT_LLVM_BB_ADDR_MAP) {
+       Version = Data.getU8(Cur);
+@@ -903,19 +903,41 @@ ELFDumper<ELFT>::dumpBBAddrMapSection(const Elf_Shdr *Shdr) {
+                 Twine(static_cast<int>(Version)));
+       Feature = Data.getU8(Cur);
+     }
+-    uint64_t Address = Data.getAddress(Cur);
+-    uint64_t NumBlocks = Data.getULEB128(Cur);
+-    std::vector<ELFYAML::BBAddrMapEntry::BBEntry> BBEntries;
+-    // Read the specified number of BB entries, or until decoding fails.
+-    for (uint64_t BlockIndex = 0; Cur && BlockIndex < NumBlocks; ++BlockIndex) {
+-      uint32_t ID = Version >= 2 ? Data.getULEB128(Cur) : BlockIndex;
+-      uint64_t Offset = Data.getULEB128(Cur);
+-      uint64_t Size = Data.getULEB128(Cur);
+-      uint64_t Metadata = Data.getULEB128(Cur);
+-      BBEntries.push_back({ID, Offset, Size, Metadata});
++    uint64_t NumBBRanges = 1;
++    uint64_t NumBlocks = 0;
++    auto FeatureOrErr = llvm::object::BBAddrMap::Features::decode(Feature);
++    if (!FeatureOrErr)
++      return FeatureOrErr.takeError();
++    if (FeatureOrErr->MultiBBRange) {
++      NumBBRanges = Data.getULEB128(Cur);
++    } else {
++      Address = Data.getAddress(Cur);
++      NumBlocks = Data.getULEB128(Cur);
++    }
++    std::vector<ELFYAML::BBAddrMapEntry::BBRangeEntry> BBRanges;
++    uint64_t BaseAddress = 0;
++    for (uint64_t BBRangeN = 0; Cur && BBRangeN != NumBBRanges; ++BBRangeN) {
++      if (FeatureOrErr->MultiBBRange) {
++        BaseAddress = Data.getAddress(Cur);
++        NumBlocks = Data.getULEB128(Cur);
++      } else {
++        BaseAddress = Address;
++      }
++
++      std::vector<ELFYAML::BBAddrMapEntry::BBEntry> BBEntries;
++      // Read the specified number of BB entries, or until decoding fails.
++      for (uint64_t BlockIndex = 0; Cur && BlockIndex < NumBlocks;
++           ++BlockIndex) {
++        uint32_t ID = Version >= 2 ? Data.getULEB128(Cur) : BlockIndex;
++        uint64_t Offset = Data.getULEB128(Cur);
++        uint64_t Size = Data.getULEB128(Cur);
++        uint64_t Metadata = Data.getULEB128(Cur);
++        BBEntries.push_back({ID, Offset, Size, Metadata});
++      }
++      BBRanges.push_back({BaseAddress, /*NumBlocks=*/{}, BBEntries});
+     }
+     Entries.push_back(
+-        {Version, Feature, Address, /*NumBlocks=*/{}, std::move(BBEntries)});
++        {Version, Feature, /*NumBBRanges=*/{}, std::move(BBRanges)});
+   }
+ 
+   if (!Cur) {
+diff --git a/llvm/unittests/Object/ELFObjectFileTest.cpp b/llvm/unittests/Object/ELFObjectFileTest.cpp
+index c539d79ac14e..c4d2b4ae8b9a 100644
+--- a/llvm/unittests/Object/ELFObjectFileTest.cpp
++++ b/llvm/unittests/Object/ELFObjectFileTest.cpp
+@@ -511,7 +511,6 @@ Sections:
+   - Type: SHT_LLVM_BB_ADDR_MAP
+     Name: .llvm_bb_addr_map
+     Entries:
+-      - Address: 0x11111
+ )");
+ 
+   auto DoCheck = [&](StringRef YamlString, const char *ErrMsg) {
+@@ -531,11 +530,13 @@ Sections:
+   // Check that we can detect unsupported versions.
+   SmallString<128> UnsupportedVersionYamlString(CommonYamlString);
+   UnsupportedVersionYamlString += R"(
+-        Version: 3
+-        BBEntries:
+-          - AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++      - Version: 3
++        BBRanges:
++          - BaseAddress: 0x11111
++            BBEntries:
++              - AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+ )";
+ 
+   {
+@@ -544,14 +545,28 @@ Sections:
+             "unsupported SHT_LLVM_BB_ADDR_MAP version: 3");
+   }
+ 
++  SmallString<128> ZeroBBRangesYamlString(CommonYamlString);
++  ZeroBBRangesYamlString += R"(
++      - Version: 2
++        Feature: 0x8
++        BBRanges: []
++)";
++  {
++    SCOPED_TRACE("zero bb ranges");
++    DoCheck(ZeroBBRangesYamlString,
++            "invalid zero number of BB ranges at offset 3 in "
++            "SHT_LLVM_BB_ADDR_MAP section with index 1");
++  }
++
+   SmallString<128> CommonVersionedYamlString(CommonYamlString);
+   CommonVersionedYamlString += R"(
+-        Version: 2
+-        BBEntries:
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++      - Version: 2
++        BBRanges:
++          - BaseAddress: 0x11111
++            BBEntries:
++              - AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+ )";
+ 
+   // Check that we can detect the malformed encoding when the section is
+@@ -572,24 +587,24 @@ Sections:
+   SmallVector<SmallString<128>, 3> OverInt32LimitYamlStrings(
+       3, CommonVersionedYamlString);
+   OverInt32LimitYamlStrings[0] += R"(
+-          - ID:            1
+-            AddressOffset: 0x100000000
+-            Size:          0xFFFFFFFF
+-            Metadata:      0xFFFFFFFF
++              - ID:            1
++                AddressOffset: 0x100000000
++                Size:          0xFFFFFFFF
++                Metadata:      0xFFFFFFFF
+ )";
+ 
+   OverInt32LimitYamlStrings[1] += R"(
+-          - ID:            2
+-            AddressOffset: 0xFFFFFFFF
+-            Size:          0x100000000
+-            Metadata:      0xFFFFFFFF
++              - ID:            2
++                AddressOffset: 0xFFFFFFFF
++                Size:          0x100000000
++                Metadata:      0xFFFFFFFF
+ )";
+ 
+   OverInt32LimitYamlStrings[2] += R"(
+-          - ID:            3
+-            AddressOffset: 0xFFFFFFFF
+-            Size:          0xFFFFFFFF
+-            Metadata:      0x100000000
++              - ID:            3
++                AddressOffset: 0xFFFFFFFF
++                Size:          0xFFFFFFFF
++                Metadata:      0x100000000
+ )";
+ 
+   {
+@@ -635,7 +650,7 @@ Sections:
+   // with an out-of-range value.
+   SmallString<128> OverLimitNumBlocks(CommonVersionedYamlString);
+   OverLimitNumBlocks += R"(
+-        NumBlocks: 0x100000000
++            NumBlocks: 0x100000000
+ )";
+ 
+   {
+@@ -643,6 +658,16 @@ Sections:
+     DoCheck(OverLimitNumBlocks,
+             "ULEB128 value at offset 0xa exceeds UINT32_MAX (0x100000000)");
+   }
++
++  // Check for proper error handling when the 'NumBBRanges' field is overridden
++  // with an out-of-range value.
++  SmallString<128> OverLimitNumBBRanges(CommonVersionedYamlString);
++  OverLimitNumBBRanges += R"(
++        NumBBRanges: 0x100000000
++        Feature:     0x8
++)";
++  DoCheck(OverLimitNumBBRanges,
++          "ULEB128 value at offset 0x2 exceeds UINT32_MAX (0x100000000)");
+ }
+ 
+ // Test for the ELFObjectFile::readBBAddrMap API.
+@@ -659,51 +684,67 @@ Sections:
+     Link: 1
+     Entries:
+       - Version: 2
+-        Address: 0x11111
+-        BBEntries:
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++        BBRanges:
++          - BaseAddress: 0x11111
++            BBEntries:
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+   - Name: .llvm_bb_addr_map_2
+     Type: SHT_LLVM_BB_ADDR_MAP
+     Link: 1
+     Entries:
+       - Version: 2
+-        Address: 0x22222
+-        BBEntries:
+-          - ID:            2
+-            AddressOffset: 0x0
+-            Size:          0x2
+-            Metadata:      0x4
++        Feature: 0x8
++        BBRanges:
++          - BaseAddress: 0x22222
++            BBEntries:
++              - ID:            2
++                AddressOffset: 0x0
++                Size:          0x2
++                Metadata:      0x4
++          - BaseAddress: 0xFFFFF
++            BBEntries:
++              - ID:            15
++                AddressOffset: 0xF0
++                Size:          0xF1
++                Metadata:      0x1F
+   - Name: .llvm_bb_addr_map_3
+     Type: SHT_LLVM_BB_ADDR_MAP
+     Link: 2
+     Entries:
+       - Version: 1
+-        Address: 0x33333
+-        BBEntries:
+-          - ID:            0
+-            AddressOffset: 0x0
+-            Size:          0x3
+-            Metadata:      0x6
++        BBRanges:
++          - BaseAddress: 0x33333
++            BBEntries:
++              - ID:            0
++                AddressOffset: 0x0
++                Size:          0x3
++                Metadata:      0x6
+   - Name: .llvm_bb_addr_map_4
+-    Type: SHT_LLVM_BB_ADDR_MAP_V0
++    Type: SHT_LLVM_BB_ADDR_MAP
+   # Link: 0 (by default, can be overriden)
+     Entries:
+-      - Version: 0
+-        Address: 0x44444
+-        BBEntries:
+-          - ID:            0
+-            AddressOffset: 0x0
+-            Size:          0x4
+-            Metadata:      0x18
++      - Version: 2
++        BBRanges:
++          - BaseAddress: 0x44444
++            BBEntries:
++              - ID:            0
++                AddressOffset: 0x0
++                Size:          0x4
++                Metadata:      0x18
+ )");
+ 
+-  BBAddrMap E1(0x11111, {{1, 0x0, 0x1, {false, true, false, false, false}}});
+-  BBAddrMap E2(0x22222, {{2, 0x0, 0x2, {false, false, true, false, false}}});
+-  BBAddrMap E3(0x33333, {{0, 0x0, 0x3, {false, true, true, false, false}}});
+-  BBAddrMap E4(0x44444, {{0, 0x0, 0x4, {false, false, false, true, true}}});
++  BBAddrMap E1 = {
++      {{0x11111, {{1, 0x0, 0x1, {false, true, false, false, false}}}}}};
++  BBAddrMap E2 = {
++      {{0x22222, {{2, 0x0, 0x2, {false, false, true, false, false}}}},
++       {0xFFFFF, {{15, 0xF0, 0xF1, {true, true, true, true, true}}}}}};
++  BBAddrMap E3 = {
++      {{0x33333, {{0, 0x0, 0x3, {false, true, true, false, false}}}}}};
++  BBAddrMap E4 = {
++      {{0x44444, {{0, 0x0, 0x4, {false, false, false, true, true}}}}}};
+ 
+   std::vector<BBAddrMap> Section0BBAddrMaps = {E4};
+   std::vector<BBAddrMap> Section1BBAddrMaps = {E3};
+@@ -767,13 +808,13 @@ Sections:
+   // (not present) section.
+   SmallString<128> InvalidLinkedYamlString(CommonYamlString);
+   InvalidLinkedYamlString += R"(
+-    Link: 10
++    Link: 121
+ )";
+ 
+   DoCheckFails(InvalidLinkedYamlString, /*TextSectionIndex=*/4,
+                "unable to get the linked-to section for "
+-               "SHT_LLVM_BB_ADDR_MAP_V0 section with index 4: invalid section "
+-               "index: 10");
++               "SHT_LLVM_BB_ADDR_MAP section with index 4: invalid section "
++               "index: 121");
+   {
+     SCOPED_TRACE("invalid linked section");
+     // Linked sections are not checked when we don't target a specific text
+@@ -785,14 +826,14 @@ Sections:
+   // Check that we can detect when bb-address-map decoding fails.
+   SmallString<128> TruncatedYamlString(CommonYamlString);
+   TruncatedYamlString += R"(
+-    ShSize: 0x8
++    ShSize: 0xa
+ )";
+ 
+   {
+     SCOPED_TRACE("truncated section");
+     DoCheckFails(TruncatedYamlString, /*TextSectionIndex=*/std::nullopt,
+-                 "unable to read SHT_LLVM_BB_ADDR_MAP_V0 section with index 4: "
+-                 "unable to decode LEB128 at offset 0x00000008: malformed "
++                 "unable to read SHT_LLVM_BB_ADDR_MAP section with index 4: "
++                 "unable to decode LEB128 at offset 0x0000000a: malformed "
+                  "uleb128, extends past end");
+ 
+     // Check that we can read the other section's bb-address-maps which are
+@@ -815,7 +856,6 @@ Sections:
+   - Type: SHT_LLVM_BB_ADDR_MAP
+     Name: .llvm_bb_addr_map
+     Entries:
+-      - Address: 0x11111
+ )");
+ 
+   auto DoCheck = [&](StringRef YamlString, const char *ErrMsg) {
+@@ -839,12 +879,13 @@ Sections:
+   // Check that we can detect unsupported versions that are too old.
+   SmallString<128> UnsupportedLowVersionYamlString(CommonYamlString);
+   UnsupportedLowVersionYamlString += R"(
+-        Version: 1
++      - Version: 1
+         Feature: 0x4
+-        BBEntries:
+-          - AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++        BBRanges:
++          - BBEntries:
++              - AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+ )";
+ 
+   {
+@@ -856,38 +897,39 @@ Sections:
+ 
+   SmallString<128> CommonVersionedYamlString(CommonYamlString);
+   CommonVersionedYamlString += R"(
+-        Version: 2
+-        BBEntries:
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++      - Version: 2
++        BBRanges:
++          - BBEntries:
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+ )";
+ 
+   // Check that we fail when function entry count is enabled but not provided.
+   SmallString<128> MissingFuncEntryCount(CommonYamlString);
+   MissingFuncEntryCount += R"(
+-        Version: 2
++      - Version: 2
+         Feature: 0x01
+ )";
+ 
+   {
+     SCOPED_TRACE("missing function entry count");
+     DoCheck(MissingFuncEntryCount,
+-            "unable to decode LEB128 at offset 0x0000000b: malformed uleb128, "
+-            "extends past end");
++            "unexpected end of data at offset 0x2 while reading [0x2, 0xa)");
+   }
+ 
+   // Check that we fail when basic block frequency is enabled but not provided.
+   SmallString<128> MissingBBFreq(CommonYamlString);
+   MissingBBFreq += R"(
+-        Version: 2
++      - Version: 2
+         Feature: 0x02
+-        BBEntries:
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++        BBRanges:
++          - BBEntries:
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+ )";
+ 
+   {
+@@ -899,21 +941,22 @@ Sections:
+   // Check that we fail when branch probability is enabled but not provided.
+   SmallString<128> MissingBrProb(CommonYamlString);
+   MissingBrProb += R"(
+-        Version: 2
++      - Version: 2
+         Feature: 0x04
+-        BBEntries:
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x6
+-          - ID:            2
+-            AddressOffset: 0x1
+-            Size:          0x1
+-            Metadata:      0x2
+-          - ID:            3
+-            AddressOffset: 0x2
+-            Size:          0x1
+-            Metadata:      0x2
++        BBRanges:
++          - BBEntries:
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x6
++              - ID:            2
++                AddressOffset: 0x1
++                Size:          0x1
++                Metadata:      0x2
++              - ID:            3
++                AddressOffset: 0x2
++                Size:          0x1
++                Metadata:      0x2
+     PGOAnalyses:
+       - PGOBBEntries:
+          - Successors:
+@@ -947,13 +990,14 @@ Sections:
+     Link: 1
+     Entries:
+       - Version: 2
+-        Address: 0x11111
+         Feature: 0x1
+-        BBEntries:
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x1
+-            Metadata:      0x2
++        BBRanges:
++          - BaseAddress: 0x11111
++            BBEntries:
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x1
++                Metadata:      0x2
+     PGOAnalyses:
+       - FuncEntryCount: 892
+   - Name: .llvm_bb_addr_map_2
+@@ -961,13 +1005,14 @@ Sections:
+     Link: 1
+     Entries:
+       - Version: 2
+-        Address: 0x22222
+         Feature: 0x2
+-        BBEntries:
+-          - ID:            2
+-            AddressOffset: 0x0
+-            Size:          0x2
+-            Metadata:      0x4
++        BBRanges:
++          - BaseAddress: 0x22222
++            BBEntries:
++              - ID:            2
++                AddressOffset: 0x0
++                Size:          0x2
++                Metadata:      0x4
+     PGOAnalyses:
+       - PGOBBEntries:
+          - BBFreq:         343
+@@ -976,21 +1021,22 @@ Sections:
+     Link: 2
+     Entries:
+       - Version: 2
+-        Address: 0x33333
+         Feature: 0x4
+-        BBEntries:
+-          - ID:            0
+-            AddressOffset: 0x0
+-            Size:          0x3
+-            Metadata:      0x6
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x3
+-            Metadata:      0x4
+-          - ID:            2
+-            AddressOffset: 0x0
+-            Size:          0x3
+-            Metadata:      0x0
++        BBRanges:
++          - BaseAddress: 0x33333
++            BBEntries:
++              - ID:            0
++                AddressOffset: 0x0
++                Size:          0x3
++                Metadata:      0x6
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x3
++                Metadata:      0x4
++              - ID:            2
++                AddressOffset: 0x0
++                Size:          0x3
++                Metadata:      0x0
+     PGOAnalyses:
+       - PGOBBEntries:
+          - Successors:
+@@ -1007,25 +1053,26 @@ Sections:
+   # Link: 0 (by default, can be overriden)
+     Entries:
+       - Version: 2
+-        Address: 0x44444
+         Feature: 0x7
+-        BBEntries:
+-          - ID:            0
+-            AddressOffset: 0x0
+-            Size:          0x4
+-            Metadata:      0x18
+-          - ID:            1
+-            AddressOffset: 0x0
+-            Size:          0x4
+-            Metadata:      0x0
+-          - ID:            2
+-            AddressOffset: 0x0
+-            Size:          0x4
+-            Metadata:      0x0
+-          - ID:            3
+-            AddressOffset: 0x0
+-            Size:          0x4
+-            Metadata:      0x0
++        BBRanges:
++          - BaseAddress: 0x44444
++            BBEntries:
++              - ID:            0
++                AddressOffset: 0x0
++                Size:          0x4
++                Metadata:      0x18
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x4
++                Metadata:      0x0
++              - ID:            2
++                AddressOffset: 0x0
++                Size:          0x4
++                Metadata:      0x0
++              - ID:            3
++                AddressOffset: 0x0
++                Size:          0x4
++                Metadata:      0x0
+     PGOAnalyses:
+       - FuncEntryCount: 1000
+         PGOBBEntries:
+@@ -1054,34 +1101,74 @@ Sections:
+   # Link: 0 (by default, can be overriden)
+     Entries:
+       - Version: 2
+-        Address: 0x55555
+         Feature: 0x0
+-        BBEntries:
+-          - ID:            2
+-            AddressOffset: 0x0
+-            Size:          0x2
+-            Metadata:      0x4
++        BBRanges:
++          - BaseAddress: 0x55555
++            BBEntries:
++              - ID:            2
++                AddressOffset: 0x0
++                Size:          0x2
++                Metadata:      0x4
+     PGOAnalyses: [{}]
+- )");
+-
+-  BBAddrMap E1(0x11111, {{1, 0x0, 0x1, {false, true, false, false, false}}});
+-  PGOAnalysisMap P1 = {892, {}, {true, false, false}};
+-  BBAddrMap E2(0x22222, {{2, 0x0, 0x2, {false, false, true, false, false}}});
+-  PGOAnalysisMap P2 = {{}, {{BlockFrequency(343), {}}}, {false, true, false}};
+-  BBAddrMap E3(0x33333, {{0, 0x0, 0x3, {false, true, true, false, false}},
+-                         {1, 0x3, 0x3, {false, false, true, false, false}},
+-                         {2, 0x6, 0x3, {false, false, false, false, false}}});
++  - Name: .llvm_bb_addr_map_6
++    Type: SHT_LLVM_BB_ADDR_MAP
++  # Link: 0 (by default, can be overriden)
++    Entries:
++      - Version: 2
++        Feature: 0xc
++        BBRanges:
++          - BaseAddress: 0x66666
++            BBEntries:
++              - ID:            0
++                AddressOffset: 0x0
++                Size:          0x6
++                Metadata:      0x6
++              - ID:            1
++                AddressOffset: 0x0
++                Size:          0x6
++                Metadata:      0x4
++          - BaseAddress: 0x666661
++            BBEntries:
++              - ID:            2
++                AddressOffset: 0x0
++                Size:          0x6
++                Metadata:      0x0
++    PGOAnalyses:
++      - PGOBBEntries:
++         - Successors:
++            - ID:          1
++              BrProb:      0x22222222
++            - ID:          2
++              BrProb:      0xcccccccc
++         - Successors:
++            - ID:          2
++              BrProb:      0x88888888
++         - Successors:     []
++)");
++
++  BBAddrMap E1 = {
++      {{0x11111, {{1, 0x0, 0x1, {false, true, false, false, false}}}}}};
++  PGOAnalysisMap P1 = {892, {}, {true, false, false, false}};
++  BBAddrMap E2 = {
++      {{0x22222, {{2, 0x0, 0x2, {false, false, true, false, false}}}}}};
++  PGOAnalysisMap P2 = {
++      {}, {{BlockFrequency(343), {}}}, {false, true, false, false}};
++  BBAddrMap E3 = {{{0x33333,
++                    {{0, 0x0, 0x3, {false, true, true, false, false}},
++                     {1, 0x3, 0x3, {false, false, true, false, false}},
++                     {2, 0x6, 0x3, {false, false, false, false, false}}}}}};
+   PGOAnalysisMap P3 = {{},
+                        {{{},
+                          {{1, BranchProbability::getRaw(0x1111'1111)},
+                           {2, BranchProbability::getRaw(0xeeee'eeee)}}},
+                         {{}, {{2, BranchProbability::getRaw(0xffff'ffff)}}},
+                         {{}, {}}},
+-                       {false, false, true}};
+-  BBAddrMap E4(0x44444, {{0, 0x0, 0x4, {false, false, false, true, true}},
+-                         {1, 0x4, 0x4, {false, false, false, false, false}},
+-                         {2, 0x8, 0x4, {false, false, false, false, false}},
+-                         {3, 0xc, 0x4, {false, false, false, false, false}}});
++                       {false, false, true, false}};
++  BBAddrMap E4 = {{{0x44444,
++                    {{0, 0x0, 0x4, {false, false, false, true, true}},
++                     {1, 0x4, 0x4, {false, false, false, false, false}},
++                     {2, 0x8, 0x4, {false, false, false, false, false}},
++                     {3, 0xc, 0x4, {false, false, false, false, false}}}}}};
+   PGOAnalysisMap P4 = {
+       1000,
+       {{BlockFrequency(1000),
+@@ -1093,19 +1180,32 @@ Sections:
+          {3, BranchProbability::getRaw(0xeeee'eeee)}}},
+        {BlockFrequency(18), {{3, BranchProbability::getRaw(0xffff'ffff)}}},
+        {BlockFrequency(1000), {}}},
+-      {true, true, true}};
+-  BBAddrMap E5(0x55555, {{2, 0x0, 0x2, {false, false, true, false, false}}});
+-  PGOAnalysisMap P5 = {{}, {}, {false, false, false}};
++      {true, true, true, false}};
++  BBAddrMap E5 = {
++      {{0x55555, {{2, 0x0, 0x2, {false, false, true, false, false}}}}}};
++  PGOAnalysisMap P5 = {{}, {}, {false, false, false, false}};
++  BBAddrMap E6 = {
++      {{0x66666,
++        {{0, 0x0, 0x6, {false, true, true, false, false}},
++         {1, 0x6, 0x6, {false, false, true, false, false}}}},
++       {0x666661, {{2, 0x0, 0x6, {false, false, false, false, false}}}}}};
++  PGOAnalysisMap P6 = {{},
++                       {{{},
++                         {{1, BranchProbability::getRaw(0x2222'2222)},
++                          {2, BranchProbability::getRaw(0xcccc'cccc)}}},
++                        {{}, {{2, BranchProbability::getRaw(0x8888'8888)}}},
++                        {{}, {}}},
++                       {false, false, true, true}};
+ 
+-  std::vector<BBAddrMap> Section0BBAddrMaps = {E4, E5};
++  std::vector<BBAddrMap> Section0BBAddrMaps = {E4, E5, E6};
+   std::vector<BBAddrMap> Section1BBAddrMaps = {E3};
+   std::vector<BBAddrMap> Section2BBAddrMaps = {E1, E2};
+-  std::vector<BBAddrMap> AllBBAddrMaps = {E1, E2, E3, E4, E5};
++  std::vector<BBAddrMap> AllBBAddrMaps = {E1, E2, E3, E4, E5, E6};
+ 
+-  std::vector<PGOAnalysisMap> Section0PGOAnalysisMaps = {P4, P5};
++  std::vector<PGOAnalysisMap> Section0PGOAnalysisMaps = {P4, P5, P6};
+   std::vector<PGOAnalysisMap> Section1PGOAnalysisMaps = {P3};
+   std::vector<PGOAnalysisMap> Section2PGOAnalysisMaps = {P1, P2};
+-  std::vector<PGOAnalysisMap> AllPGOAnalysisMaps = {P1, P2, P3, P4, P5};
++  std::vector<PGOAnalysisMap> AllPGOAnalysisMaps = {P1, P2, P3, P4, P5, P6};
+ 
+   auto DoCheckSucceeds =
+       [&](StringRef YamlString, std::optional<unsigned> TextSectionIndex,
+@@ -1131,10 +1231,21 @@ Sections:
+         EXPECT_EQ(*BBAddrMaps, ExpectedResult);
+         if (ExpectedPGO) {
+           EXPECT_EQ(BBAddrMaps->size(), PGOAnalyses.size());
++          for (const auto &PGO : PGOAnalyses) {
++            errs() << "FuncEntryCount: " << PGO.FuncEntryCount << "\n";
++            for (const auto &PGOBB : PGO.BBEntries)
++              errs() << "\tBB: " << PGOBB.BlockFreq.getFrequency() << "\n";
++          }
++          errs() << " To expected:\n";
++          for (const auto &PGO : *ExpectedPGO) {
++            errs() << "FuncEntryCount: " << PGO.FuncEntryCount << "\n";
++            for (const auto &PGOBB : PGO.BBEntries)
++              errs() << "\tBB: " << PGOBB.BlockFreq.getFrequency() << "\n";
++          }
+           EXPECT_EQ(PGOAnalyses, *ExpectedPGO);
+           for (auto &&[BB, PGO] : llvm::zip(*BBAddrMaps, PGOAnalyses)) {
+             if (PGO.FeatEnable.BBFreq || PGO.FeatEnable.BrProb)
+-              EXPECT_EQ(BB.getBBEntries().size(), PGO.BBEntries.size());
++              EXPECT_EQ(BB.getNumBBEntries(), PGO.BBEntries.size());
+           }
+         }
+       };
+@@ -1190,15 +1301,15 @@ Sections:
+   // (not present) section.
+   SmallString<128> InvalidLinkedYamlString(CommonYamlString);
+   InvalidLinkedYamlString += R"(
+-    Link: 10
++    Link: 121
+ )";
+ 
+   {
+     SCOPED_TRACE("invalid linked section");
+     DoCheckFails(InvalidLinkedYamlString, /*TextSectionIndex=*/5,
+                  "unable to get the linked-to section for "
+-                 "SHT_LLVM_BB_ADDR_MAP section with index 5: invalid section "
+-                 "index: 10");
++                 "SHT_LLVM_BB_ADDR_MAP section with index 6: invalid section "
++                 "index: 121");
+ 
+     // Linked sections are not checked when we don't target a specific text
+     // section.
+@@ -1216,10 +1327,10 @@ Sections:
+ 
+   {
+     SCOPED_TRACE("truncated section");
+-    DoCheckFails(TruncatedYamlString, /*TextSectionIndex=*/std::nullopt,
+-                 "unable to read SHT_LLVM_BB_ADDR_MAP section with index 5: "
+-                 "unable to decode LEB128 at offset 0x0000000a: malformed "
+-                 "uleb128, extends past end");
++    DoCheckFails(
++        TruncatedYamlString, /*TextSectionIndex=*/std::nullopt,
++        "unable to read SHT_LLVM_BB_ADDR_MAP section with index 6: "
++        "unexpected end of data at offset 0xa while reading [0x3, 0xb)");
+     // Check that we can read the other section's bb-address-maps which are
+     // valid.
+     DoCheckSucceeds(TruncatedYamlString, /*TextSectionIndex=*/2,
+diff --git a/llvm/unittests/Object/ELFTypesTest.cpp b/llvm/unittests/Object/ELFTypesTest.cpp
+index f09ab5e12438..f04d45cf0983 100644
+--- a/llvm/unittests/Object/ELFTypesTest.cpp
++++ b/llvm/unittests/Object/ELFTypesTest.cpp
+@@ -100,34 +100,36 @@ static_assert(
+                    decltype(BBAddrMap::BBEntry::ID)>,
+     "PGOAnalysisMap should use the same type for basic block ID as BBAddrMap");
+ 
+-TEST(ELFTypesTest, PGOAnalysisMapFeaturesEncodingTest) {
+-  const std::array<PGOAnalysisMap::Features, 7> Decoded = {
+-      {{false, false, false},
+-       {true, false, false},
+-       {false, true, false},
+-       {false, false, true},
+-       {true, true, false},
+-       {false, true, true},
+-       {true, true, true}}};
+-  const std::array<uint8_t, 7> Encoded = {
+-      {0b000, 0b001, 0b010, 0b100, 0b011, 0b110, 0b111}};
++TEST(ELFTypesTest, BBAddrMapFeaturesEncodingTest) {
++  const std::array<BBAddrMap::Features, 9> Decoded = {
++      {{false, false, false, false},
++       {true, false, false, false},
++       {false, true, false, false},
++       {false, false, true, false},
++       {false, false, false, true},
++       {true, true, false, false},
++       {false, true, true, false},
++       {false, true, true, true},
++       {true, true, true, true}}};
++  const std::array<uint8_t, 9> Encoded = {
++      {0b0000, 0b0001, 0b0010, 0b0100, 0b1000, 0b0011, 0b0110, 0b1110, 0b1111}};
+   for (const auto &[Feat, EncodedVal] : llvm::zip(Decoded, Encoded))
+     EXPECT_EQ(Feat.encode(), EncodedVal);
+   for (const auto &[Feat, EncodedVal] : llvm::zip(Decoded, Encoded)) {
+-    Expected<PGOAnalysisMap::Features> FeatEnableOrError =
+-        PGOAnalysisMap::Features::decode(EncodedVal);
++    Expected<BBAddrMap::Features> FeatEnableOrError =
++        BBAddrMap::Features::decode(EncodedVal);
+     ASSERT_THAT_EXPECTED(FeatEnableOrError, Succeeded());
+     EXPECT_EQ(*FeatEnableOrError, Feat);
+   }
+ }
+ 
+-TEST(ELFTypesTest, PGOAnalysisMapFeaturesInvalidEncodingTest) {
++TEST(ELFTypesTest, BBAddrMapFeaturesInvalidEncodingTest) {
+   const std::array<std::string, 2> Errors = {
+-      "invalid encoding for PGOAnalysisMap::Features: 0x8",
+-      "invalid encoding for PGOAnalysisMap::Features: 0xff"};
+-  const std::array<uint8_t, 2> Values = {{0b1000, 0b1111'1111}};
++      "invalid encoding for BBAddrMap::Features: 0x10",
++      "invalid encoding for BBAddrMap::Features: 0xff"};
++  const std::array<uint8_t, 2> Values = {{0b10000, 0b1111'1111}};
+   for (const auto &[Val, Error] : llvm::zip(Values, Errors)) {
+-    EXPECT_THAT_ERROR(PGOAnalysisMap::Features::decode(Val).takeError(),
++    EXPECT_THAT_ERROR(BBAddrMap::Features::decode(Val).takeError(),
+                       FailedWithMessage(Error));
+   }
+ }

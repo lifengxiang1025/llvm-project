@@ -1648,6 +1648,11 @@ Expected<bool> FunctionImporter::importFunctions(
               "thinlto_src_module",
               MDNode::get(DestModule.getContext(),
                           {MDString::get(DestModule.getContext(),
+                                         SrcModule->getModuleIdentifier())}));
+          F.setMetadata(
+              "thinlto_src_file",
+              MDNode::get(DestModule.getContext(),
+                          {MDString::get(DestModule.getContext(),
                                          SrcModule->getSourceFileName())}));
         }
         GlobalsToImport.insert(&F);
