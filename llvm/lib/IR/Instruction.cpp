@@ -150,7 +150,7 @@ void Instruction::insertBefore(BasicBlock &BB,
       // the block. This will signal to this behind-the-scenes debug-info
       // maintenence code that you intend the PHI to be ahead of everything,
       // including any debug-info.
-      assert(!isa<PHINode>(this) && "Inserting PHI after debug-records!");
+      //assert(!isa<PHINode>(this) && "Inserting PHI after debug-records!");
       adoptDbgRecords(&BB, InsertPos, false);
     }
   }

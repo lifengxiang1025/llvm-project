@@ -68,6 +68,7 @@
 #include "llvm/Transforms/IPO/SampleProfileProbe.h"
 #include "llvm/Transforms/IPO/SyntheticCountsPropagation.h"
 #include "llvm/Transforms/IPO/WholeProgramDevirt.h"
+#include "llvm/Transforms/IPO/PreserveNoneUpdating.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/CGProfile.h"
 #include "llvm/Transforms/Instrumentation/ControlHeightReduction.h"
@@ -299,6 +300,10 @@ static cl::opt<AttributorRunOption> AttributorRun(
 static cl::opt<bool> UseLoopVersioningLICM(
     "enable-loop-versioning-licm", cl::init(false), cl::Hidden,
     cl::desc("Enable the experimental Loop Versioning LICM pass"));
+
+static cl::opt<bool> EnablePreserveNoneUpdating("enable-preserve-none-updating",
+                                                cl::init(false), cl::Hidden,
+                                                cl::desc(""));
 
 namespace llvm {
 extern cl::opt<bool> EnableMemProfContextDisambiguation;
@@ -2042,6 +2047,9 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
     MPM.addPass(CGProfilePass(/*InLTOPostLink=*/true));
 
   invokeFullLinkTimeOptimizationLastEPCallbacks(MPM, Level);
+
+  if (EnablePreserveNoneUpdating)
+    MPM.addPass(PreserveNoneUpdatingPass());
 
   // Emit annotation remarks.
   addAnnotationRemarksPass(MPM);

@@ -7906,9 +7906,9 @@ def fnative_half_arguments_and_returns : Flag<["-"], "fnative-half-arguments-and
   ImpliedByAnyOf<[open_cl.KeyPath, render_script.KeyPath, hlsl.KeyPath]>;
 def fdefault_calling_conv_EQ : Joined<["-"], "fdefault-calling-conv=">,
   HelpText<"Set default calling convention">,
-  Values<"cdecl,fastcall,stdcall,vectorcall,regcall,rtdcall">,
+  Values<"cdecl,fastcall,stdcall,vectorcall,regcall,rtdcall,preserve_none">,
   NormalizedValuesScope<"LangOptions">,
-  NormalizedValues<["DCC_CDecl", "DCC_FastCall", "DCC_StdCall", "DCC_VectorCall", "DCC_RegCall", "DCC_RtdCall"]>,
+  NormalizedValues<["DCC_CDecl", "DCC_FastCall", "DCC_StdCall", "DCC_VectorCall", "DCC_RegCall", "DCC_RtdCall","DCC_PreserveNone"]>,
   MarshallingInfoEnum<LangOpts<"DefaultCallingConv">, "DCC_None">;
 
 // These options cannot be marshalled, because they are used to set up the LangOptions defaults.

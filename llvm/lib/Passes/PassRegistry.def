@@ -125,6 +125,7 @@ MODULE_PASS("rewrite-statepoints-for-gc", RewriteStatepointsForGC())
 MODULE_PASS("rewrite-symbols", RewriteSymbolPass())
 MODULE_PASS("rpo-function-attrs", ReversePostOrderFunctionAttrsPass())
 MODULE_PASS("sample-profile", SampleProfileLoaderPass())
+MODULE_PASS("preserve-none-updating", PreserveNoneUpdatingPass())
 MODULE_PASS("sancov-module", SanitizerCoveragePass())
 MODULE_PASS("sanmd-module", SanitizerBinaryMetadataPass())
 MODULE_PASS("scc-oz-module-inliner",

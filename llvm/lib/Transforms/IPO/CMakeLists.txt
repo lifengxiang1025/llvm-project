@@ -38,6 +38,7 @@ add_llvm_component_library(LLVMipo
   SampleProfile.cpp
   SampleProfileMatcher.cpp
   SampleProfileProbe.cpp
+  PreserveNoneUpdating.cpp
   SCCP.cpp
   StripDeadPrototypes.cpp
   StripSymbols.cpp

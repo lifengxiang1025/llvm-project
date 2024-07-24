@@ -12206,6 +12206,10 @@ CallingConv ASTContext::getDefaultCallingConvention(bool IsVariadic,
       if (!IsVariadic)
         return CC_M68kRTD;
       break;
+    case LangOptions::DCC_PreserveNone:
+      if (!IsVariadic)
+        return CC_PreserveNone;
+      break;
     }
   }
   return Target->getDefaultCallingConv();
